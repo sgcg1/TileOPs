@@ -1,0 +1,19 @@
+# setuptools-scm includes every git-tracked file in the sdist by default;
+# prune development-only trees so the sdist ships only what a build needs.
+prune tests
+prune benchmarks
+prune docs
+prune assets
+prune workloads
+prune .github
+prune scripts
+
+# Same rule, for root files rather than trees.
+exclude .clang-format
+exclude .gitignore
+exclude .pre-commit-config.yaml
+exclude conftest.py
+exclude constraints.txt
+exclude constraints-runner-lock.txt
+exclude .gitattributes
+exclude CHANGELOG.md

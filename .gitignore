@@ -1,0 +1,84 @@
+# Compiled Object files
+*.o
+*.obj
+*.pyc
+
+# Editor files
+*~
+*.swp
+*.swo
+.vscode/
+.vs/
+.idea/*
+
+# Build artifacts
+build/
+dist/
+wheelhouse/
+build_sdist/
+__pycache__
+*.egg-info
+
+# Virtual environments
+venv/
+.venv/
+.tox/
+
+# Git merge artifacts
+*.orig
+\#*
+\.#*
+
+# macOS
+**/.DS_Store
+
+# Logs and data
+*.log
+*.pkl_*
+
+# Test / lint caches
+.pytest_cache
+.hypothesis
+.ruff_cache
+.cache/
+
+# Output / profiling
+output/
+output*/
+profile_out/
+tmp/
+.tmp/
+debug/
+
+# Local lock / scheduler state
+/.lock
+
+# Exception: keep the debug folder for tests
+!testing/python/debug
+
+# Secrets and credentials
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+secrets.yaml
+secrets.yml
+
+docs/plans/
+
+*.ncu-rep
+
+# Benchmark run artifacts
+profile_run.log
+bench_stack_dumps/
+bench_results.xml
+
+# Coverage output
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Local experiment archives, toolchains and profiler output
+/artifacts/

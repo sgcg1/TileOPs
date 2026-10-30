@@ -1,0 +1,328 @@
+"""Correctness tests for Welford ops when N triggers zero-padding.
+
+Validates VarFwdOp, StdFwdOp, and VarMeanFwdOp with reduction dimensions
+that are NOT multiples of 256 (the default alignment). Zero-padded elements
+must not corrupt the Welford online statistics.
+
+Covers both single-dim (dim=-1) and multi-dim cases where the flattened
+reduction dimension is non-aligned.
+"""
+
+import pytest
+import torch
+
+from tests.workload_test_base import FixtureBase, TestBase
+from workloads.device import run_device
+from workloads.numerics import compare_outputs
+from workloads.reduction import WelfordNonAlignedCase, reduction_verification
+
+
+class WelfordNonAlignedTest(WelfordNonAlignedCase, TestBase):
+    pass
+
+
+# Fixtures — non-aligned N values (not multiples of 256)
+
+
+class WelfordNonAlignedFixture(FixtureBase):
+    """2D input with non-aligned N values."""
+
+    @classmethod
+    def get_params(cls):
+        # N values chosen to exercise zero-padding edge cases:
+        #   7   — small prime, heavy padding
+        #   100 — non-power-of-two, moderate padding
+        #   255 — one below alignment boundary
+        #   257 — one above alignment boundary
+        #   513 — one above 2*256, second tile partially filled
+        #   33  — small non-power-of-two, odd padding amount
+        non_aligned_n = [7, 33, 100, 255, 257, 513]
+        return [
+            (
+                "m, n, dtype",
+                [
+                    # One representative smoke case (one above alignment boundary)
+                    pytest.param(
+                        32,
+                        257,
+                        torch.float16,
+                        marks=pytest.mark.smoke,
+                        id="m32_n257_fp16",
+                    ),
+                    pytest.param(
+                        32,
+                        257,
+                        torch.bfloat16,
+                        marks=pytest.mark.smoke,
+                        id="m32_n257_bf16",
+                    ),
+                ]
+                + [
+                    pytest.param(
+                        32,
+                        n,
+                        torch.float16,
+                        marks=pytest.mark.full,
+                        id=f"m32_n{n}_fp16",
+                    )
+                    for n in non_aligned_n
+                    if n != 257
+                ]
+                + [
+                    pytest.param(
+                        32,
+                        n,
+                        torch.bfloat16,
+                        marks=pytest.mark.full,
+                        id=f"m32_n{n}_bf16",
+                    )
+                    for n in non_aligned_n
+                    if n != 257
+                ],
+            ),
+        ]
+
+
+class WelfordNonAligned3DFixture(FixtureBase):
+    """3D input where the last dim (reduction dim) is non-aligned."""
+
+    PARAMS = [
+        (
+            "batch, seq, hidden, dtype",
+            [
+                # One representative smoke case (one below alignment boundary)
+                pytest.param(
+                    2,
+                    16,
+                    255,
+                    torch.float16,
+                    marks=pytest.mark.smoke,
+                    id="b2_s16_h255_fp16",
+                ),
+                pytest.param(
+                    2,
+                    16,
+                    255,
+                    torch.bfloat16,
+                    marks=pytest.mark.smoke,
+                    id="b2_s16_h255_bf16",
+                ),
+            ]
+            + [
+                pytest.param(
+                    2,
+                    16,
+                    n,
+                    torch.float16,
+                    marks=pytest.mark.full,
+                    id=f"b2_s16_h{n}_fp16",
+                )
+                for n in [7, 100, 257]
+            ]
+            + [
+                pytest.param(
+                    2,
+                    16,
+                    n,
+                    torch.bfloat16,
+                    marks=pytest.mark.full,
+                    id=f"b2_s16_h{n}_bf16",
+                )
+                for n in [7, 257]
+            ],
+        ),
+    ]
+
+
+class WelfordNonAlignedMultiDimFixture(FixtureBase):
+    """Multi-dim reduction where flattened reduction size is non-aligned."""
+
+    PARAMS = [
+        (
+            "shape, dims, keepdim, dtype",
+            [
+                # One representative smoke case (flattened N = 5*51 = 255)
+                pytest.param(
+                    (2, 5, 51),
+                    [1, 2],
+                    False,
+                    torch.float16,
+                    marks=pytest.mark.smoke,
+                    id="flat255_fp16",
+                ),
+                pytest.param(
+                    (4, 7, 9),
+                    [1, 2],
+                    False,
+                    torch.bfloat16,
+                    marks=pytest.mark.smoke,
+                    id="flat63_bf16",
+                ),
+                pytest.param(
+                    (4, 7, 9),
+                    [1, 2],
+                    False,
+                    torch.float16,
+                    marks=pytest.mark.smoke,
+                    id="flat63_fp16",
+                ),
+                # (3, 3, 86): reducing dims [1,2] -> flattened N = 3*86 = 258
+                pytest.param(
+                    (3, 3, 86),
+                    [1, 2],
+                    False,
+                    torch.float16,
+                    marks=pytest.mark.full,
+                    id="flat258_fp16",
+                ),
+                # keepdim variant
+                pytest.param(
+                    (2, 5, 51),
+                    [1, 2],
+                    True,
+                    torch.float16,
+                    marks=pytest.mark.full,
+                    id="flat255_keepdim_fp16",
+                ),
+            ],
+        ),
+    ]
+
+
+# VarFwdOp — non-aligned N (single-dim, dim=-1)
+
+
+@WelfordNonAlignedFixture
+def test_var_non_aligned(m: int, n: int, dtype: torch.dtype) -> None:
+    """VarFwdOp correctness with non-aligned N (zero-padding active)."""
+    from tileops._ops.reduction.reduce import VarFwdOp
+
+    test = WelfordNonAlignedTest((m, n), dtype, "var", correction=1)
+    op = VarFwdOp(dim=-1)
+    test.check(op, *test.gen_inputs())
+
+
+# StdFwdOp — non-aligned N (single-dim, dim=-1)
+
+
+@WelfordNonAlignedFixture
+def test_std_non_aligned(m: int, n: int, dtype: torch.dtype) -> None:
+    """StdFwdOp correctness with non-aligned N (zero-padding active)."""
+    from tileops._ops.reduction.reduce import StdFwdOp
+
+    test = WelfordNonAlignedTest((m, n), dtype, "std", correction=1)
+    op = StdFwdOp(dim=-1)
+    test.check(op, *test.gen_inputs())
+
+
+# VarMeanFwdOp — non-aligned N (single-dim, dim=-1)
+
+
+@WelfordNonAlignedFixture
+def test_var_mean_non_aligned(m: int, n: int, dtype: torch.dtype) -> None:
+    """VarMeanFwdOp correctness with non-aligned N (zero-padding active)."""
+    from tileops._ops.reduction.reduce import VarMeanFwdOp
+
+    test = WelfordNonAlignedTest((m, n), dtype, "var_mean", correction=1)
+    op = VarMeanFwdOp(dim=-1)
+    test.check(op, *test.gen_inputs())
+
+
+# 3D tests — non-aligned hidden dim
+
+
+@WelfordNonAligned3DFixture
+def test_var_3d_non_aligned(batch: int, seq: int, hidden: int, dtype: torch.dtype) -> None:
+    """VarFwdOp on 3D input with non-aligned last dim."""
+    from tileops._ops.reduction.reduce import VarFwdOp
+
+    x = torch.randn(batch, seq, hidden, dtype=dtype, device=run_device())
+    op = VarFwdOp(dim=-1)
+    ref = x.float().var(dim=-1, correction=1).to(dtype)
+    y = op(x)
+
+    compare_outputs(y, ref, reduction_verification((ref).dtype))
+
+
+@WelfordNonAligned3DFixture
+def test_std_3d_non_aligned(batch: int, seq: int, hidden: int, dtype: torch.dtype) -> None:
+    """StdFwdOp on 3D input with non-aligned last dim."""
+    from tileops._ops.reduction.reduce import StdFwdOp
+
+    x = torch.randn(batch, seq, hidden, dtype=dtype, device=run_device())
+    op = StdFwdOp(dim=-1)
+    ref = x.float().std(dim=-1, correction=1).to(dtype)
+    y = op(x)
+
+    compare_outputs(y, ref, reduction_verification((ref).dtype))
+
+
+@WelfordNonAligned3DFixture
+def test_var_mean_3d_non_aligned(batch: int, seq: int, hidden: int, dtype: torch.dtype) -> None:
+    """VarMeanFwdOp on 3D input with non-aligned last dim."""
+    from tileops._ops.reduction.reduce import VarMeanFwdOp
+
+    x = torch.randn(batch, seq, hidden, dtype=dtype, device=run_device())
+    op = VarMeanFwdOp(dim=-1, correction=1)
+    ref_var = x.float().var(dim=-1, correction=1).to(dtype)
+    ref_mean = x.float().mean(dim=-1).to(dtype)
+    var_out, mean_out = op(x)
+
+    compare_outputs(var_out, ref_var, reduction_verification((ref_var).dtype))
+    compare_outputs(mean_out, ref_mean, reduction_verification((ref_mean).dtype))
+
+
+# Multi-dim tests — flattened reduction size is non-aligned
+
+
+@WelfordNonAlignedMultiDimFixture
+def test_var_multidim_non_aligned(
+    shape: tuple, dims: list, keepdim: bool, dtype: torch.dtype
+) -> None:
+    """VarFwdOp multi-dim reduction where flattened N is non-aligned."""
+    from tileops._ops.reduction.reduce import VarFwdOp
+
+    x = torch.randn(*shape, dtype=dtype, device=run_device())
+    op = VarFwdOp(dim=dims, keepdim=keepdim)
+    ref = torch.var(x.float(), dim=dims, keepdim=keepdim, correction=1).to(dtype)
+    y = op(x)
+
+    assert y.shape == ref.shape, f"shape mismatch: {y.shape} vs {ref.shape}"
+    compare_outputs(y, ref, reduction_verification((ref).dtype))
+
+
+@WelfordNonAlignedMultiDimFixture
+def test_std_multidim_non_aligned(
+    shape: tuple, dims: list, keepdim: bool, dtype: torch.dtype
+) -> None:
+    """StdFwdOp multi-dim reduction where flattened N is non-aligned."""
+    from tileops._ops.reduction.reduce import StdFwdOp
+
+    x = torch.randn(*shape, dtype=dtype, device=run_device())
+    op = StdFwdOp(dim=dims, keepdim=keepdim)
+    ref = torch.std(x.float(), dim=dims, keepdim=keepdim, correction=1).to(dtype)
+    y = op(x)
+
+    assert y.shape == ref.shape, f"shape mismatch: {y.shape} vs {ref.shape}"
+    compare_outputs(y, ref, reduction_verification((ref).dtype))
+
+
+@WelfordNonAlignedMultiDimFixture
+def test_var_mean_multidim_non_aligned(
+    shape: tuple, dims: list, keepdim: bool, dtype: torch.dtype
+) -> None:
+    """VarMeanFwdOp multi-dim reduction where flattened N is non-aligned."""
+    from tileops._ops.reduction.reduce import VarMeanFwdOp
+
+    x = torch.randn(*shape, dtype=dtype, device=run_device())
+    op = VarMeanFwdOp(dim=dims, keepdim=keepdim)
+    ref_var = torch.var(x.float(), dim=dims, keepdim=keepdim, correction=1).to(dtype)
+    ref_mean = torch.mean(x.float(), dim=dims, keepdim=keepdim).to(dtype)
+    var_out, mean_out = op(x)
+
+    assert var_out.shape == ref_var.shape, f"var shape mismatch: {var_out.shape} vs {ref_var.shape}"
+    assert mean_out.shape == ref_mean.shape, (
+        f"mean shape mismatch: {mean_out.shape} vs {ref_mean.shape}"
+    )
+    compare_outputs(var_out, ref_var, reduction_verification((ref_var).dtype))
+    compare_outputs(mean_out, ref_mean, reduction_verification((ref_mean).dtype))
