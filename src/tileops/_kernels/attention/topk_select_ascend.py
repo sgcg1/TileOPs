@@ -284,52 +284,53 @@ def topk_select_ascend(R: int, N: int, K: int, W: int, G: int):
                                             T.Cast(T.uint32, state[2]) << shift
                                         )
                                         prefix[1] = prefix[1] | (T.Cast(T.uint32, 255) << shift)
-                    # Contiguous thread segments preserve ascending absolute-index tie selection.
-                    with T.SimtVF(threads=128):
-                        for thread in T.Parallel(128):
-                            count = T.alloc_var(T.int32)
-                            count = 0
-                            for offset in T.serial(T.ceildiv(N, 128)):
-                                i = thread * T.ceildiv(N, 128) + offset
-                                if (  # noqa: SIM102 -- guard the score load before evaluating its key
-                                    state[0] > 0
-                                    and i < N
-                                    and i >= starts[row // G]
-                                    and i < ends[row // G]
-                                ):
-                                    if score_key(x[row // G, i, row % G]) == prefix[0]:
-                                        count = count + 1
-                            tie_prefix[thread] = count
-                    with T.SimtVF(threads=128):
-                        for thread in T.Parallel(128):
-                            if thread == 0:
-                                base = T.alloc_var(T.int32)
-                                value = T.alloc_var(T.int32)
-                                base = 0
-                                for i in T.serial(128):
-                                    value = tie_prefix[i]
-                                    tie_prefix[i] = base
-                                    base = base + value
-                    with T.SimtVF(threads=128):
-                        for thread in T.Parallel(128):
-                            position = T.alloc_var(T.int32)
-                            position = state[1] + tie_prefix[thread]
-                            for offset in T.serial(T.ceildiv(N, 128)):
-                                i = thread * T.ceildiv(N, 128) + offset
-                                if (  # noqa: SIM102 -- guard the score load before evaluating its key
-                                    state[0] > 0
-                                    and i < N
-                                    and i >= starts[row // G]
-                                    and i < ends[row // G]
-                                ):
-                                    if score_key(x[row // G, i, row % G]) == prefix[0]:
-                                        if position < state[1] + state[0]:
-                                            out[row, position] = i
-                                        position = position + 1
-                    with T.SimtVF(threads=128):
-                        for thread in T.Parallel(128):
-                            if thread == 0:
-                                state[1] = state[1] + state[0]
-                                state[0] = 0
+                    if state[0] > 0:
+                        # Contiguous thread segments preserve ascending absolute-index tie selection.
+                        with T.SimtVF(threads=128):
+                            for thread in T.Parallel(128):
+                                count = T.alloc_var(T.int32)
+                                count = 0
+                                for offset in T.serial(T.ceildiv(N, 128)):
+                                    i = thread * T.ceildiv(N, 128) + offset
+                                    if (  # noqa: SIM102 -- guard the score load before evaluating its key
+                                        state[0] > 0
+                                        and i < N
+                                        and i >= starts[row // G]
+                                        and i < ends[row // G]
+                                    ):
+                                        if score_key(x[row // G, i, row % G]) == prefix[0]:
+                                            count = count + 1
+                                tie_prefix[thread] = count
+                        with T.SimtVF(threads=128):
+                            for thread in T.Parallel(128):
+                                if thread == 0:
+                                    base = T.alloc_var(T.int32)
+                                    value = T.alloc_var(T.int32)
+                                    base = 0
+                                    for i in T.serial(128):
+                                        value = tie_prefix[i]
+                                        tie_prefix[i] = base
+                                        base = base + value
+                        with T.SimtVF(threads=128):
+                            for thread in T.Parallel(128):
+                                position = T.alloc_var(T.int32)
+                                position = state[1] + tie_prefix[thread]
+                                for offset in T.serial(T.ceildiv(N, 128)):
+                                    i = thread * T.ceildiv(N, 128) + offset
+                                    if (  # noqa: SIM102 -- guard the score load before evaluating its key
+                                        state[0] > 0
+                                        and i < N
+                                        and i >= starts[row // G]
+                                        and i < ends[row // G]
+                                    ):
+                                        if score_key(x[row // G, i, row % G]) == prefix[0]:
+                                            if position < state[1] + state[0]:
+                                                out[row, position] = i
+                                            position = position + 1
+                        with T.SimtVF(threads=128):
+                            for thread in T.Parallel(128):
+                                if thread == 0:
+                                    state[1] = state[1] + state[0]
+                                    state[0] = 0
 
     return main

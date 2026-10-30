@@ -42,6 +42,7 @@ def _reference(scores, starts, ends, k):
         ((1, 3, 4097, 1), 2048, "random", True),
         ((1, 2, 65536, 1), 1024, "random", False),
         ((1, 3, 8193, 2), 2048, "constant", False),
+        ((1, 1, 65536, 1), 2048, "constant", False),
     ],
 )
 def test_ascend_topk(shape, k, kind, strided):
