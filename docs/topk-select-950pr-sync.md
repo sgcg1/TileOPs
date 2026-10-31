@@ -6,7 +6,11 @@
 - B2Y 仓库：`topk-950pr/` 辅助脚本及 Docker 操作指南。
 - 服务器：在已有 `yjl` 容器中克隆/更新个人 fork；由操作者从 B2Y 选择辅助文件手动传入。服务器不克隆 B2Y，不通过整项目 ZIP 覆盖源码。
 
-完整操作指南位于 B2Y 的 `topk-950pr/README.md`。默认容器内布局为：
+完整操作指南位于 B2Y 的 `topk-950pr/README.md`。
+
+新服务器交付包为 B2Y 的 `deliveries/topk-950pr-tools-20261031-r2.zip`，只含辅助材料；解压后从 `START_HERE.md` 开始。包内 `SOURCE.json` 记录参考源码提交和哈希。已有容器不一定挂载 `/data`，可以用 docker cp 传入工具，或选择已挂载的私人目录，不要求重建 yjl。
+
+默认容器内布局为：
 
 ```text
 /data/yjl/topk/
@@ -39,6 +43,6 @@ bash "$TOPK_TOOLS/run.sh" test
 
 ## 验证状态
 
-此次为 Git 历史与双仓工作流整合，没有调整候选算法。候选仍未完成新环境的 14 项 NPU 测试和四组正式计时，未发布 v0.1.4 标签。旧服务器的漂移和故障不能推断为新环境结论。
+候选源码 `49aaea36` 已在旧服务器物理卡 0 的独立缓存下通过 14 项 NPU 测试，详见 `docs/design/topk-select-950pr-card0-resume-20261031.md`。没有调整候选算法，四组性能验收仍未完成，未发布 v0.1.4 标签。新服务器须重新运行全部契约和同轮基线，旧服务器的通过、漂移和频率读数都不直接外推。
 
-当前 Windows 环境没有 torch、pytest 或 NPU，完成的是 Python 静态语法、Ruff、Bash 解析及辅助汇总的离线数据检查；新容器执行结果需由操作者验证。后续性能必须基于新服务器同轮官方 CANN TopKV2 和匹配输入，不直接引用历史倍数。
+当前 Windows 环境没有 torch、pytest 或 NPU。新交付材料在本地完成 Python/Ruff/Bash 静态检查与离线数据验证，新容器执行结果仍需由操作者验证。包内加入持续负载遥测、时钟交叉检查、独立缓存和按 case 分开的官方模型测量，不修改共享频率、驱动或系统配置。原始数据留在保密环境，可按包内 `RESULTS_TEMPLATE.md` 仅回传允许披露的摘要。
