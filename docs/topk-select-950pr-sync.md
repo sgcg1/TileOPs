@@ -4,18 +4,18 @@
 
 - TileOPs 仓库：实现、项目测试、设计与正式性能记录。
 - B2Y 仓库：`topk-950pr/` 辅助脚本及 Docker 操作指南。
-- 服务器：在已有 `yjl` 容器中克隆/更新个人 fork；由操作者从 B2Y 选择辅助文件手动传入。服务器不克隆 B2Y，不通过整项目 ZIP 覆盖源码。
+- 服务器：在已有 `yjl` 容器中直接克隆/更新个人 fork 和 B2Y；工具从 B2Y/topk-950pr 运行。
 
 完整操作指南位于 B2Y 的 `topk-950pr/README.md`。
 
-新服务器交付包为 B2Y 的 `deliveries/topk-950pr-tools-20261031-r3.zip`，只含辅助材料；解压后从 `START_HERE.md` 开始。包内 `SOURCE.json` 记录参考源码提交和哈希。实际环境为已有 yjl、镜像 Weekly 20260930、私人目录 `/home/y00937463`，已挂载 `/home:/home`；使用容器内 python3，不使用 Conda、不重建容器。
+当前指南为 B2Y 的 `topk-950pr/START_HERE.md`（20261031-r4），在容器内 clone 后直接阅读，无需下载交付 ZIP。`SOURCE.json` 记录参考源码提交和哈希。实际环境为已有 yjl、镜像 Weekly 20260930、私人目录 `/home/y00937463`，已挂载 `/home:/home`；直接使用容器内 python3。
 
 默认容器内布局为：
 
 ```text
 /home/y00937463/
   TileOPs/   # git clone 个人 fork，分支 main
-  tools/     # 从 B2Y topk-950pr/ 手动传入的文件
+  B2Y/       # 直接克隆 B2Y，工具入口 topk-950pr/
   runs/      # 每轮独立原始结果，留在服务器
   tmp/       # 私人临时目录
 ```
@@ -23,10 +23,11 @@
 路径、设备号和环境可覆盖，以实际获准配置为准。宿主机执行 `docker exec -it yjl /bin/bash`，随后在容器内执行：
 
 ```bash
+git clone --branch main https://gitcode.com/JotaroSSR/B2Y.git /home/y00937463/B2Y
 git clone --branch main https://github.com/sgcg1/TileOPs.git /home/y00937463/TileOPs
 git -C /home/y00937463/TileOPs fetch origin --tags
 # 使用容器内 Python；如镜像未加载CANN，先source实际toolkit环境脚本。
-source /home/y00937463/tools/env.sh
+source /home/y00937463/B2Y/topk-950pr/env.sh
 bash "$TOPK_TOOLS/run.sh" preflight
 bash "$TOPK_TOOLS/run.sh" test
 ```
