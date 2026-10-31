@@ -79,3 +79,6 @@ bench_results.xml
 .coverage.*
 coverage.xml
 htmlcov/
+
+# Local experiment archives, toolchains and profiler output
+/artifacts/
