@@ -8,12 +8,12 @@
 
 完整操作指南位于 B2Y 的 `topk-950pr/README.md`。
 
-新服务器交付包为 B2Y 的 `deliveries/topk-950pr-tools-20261031-r2.zip`，只含辅助材料；解压后从 `START_HERE.md` 开始。包内 `SOURCE.json` 记录参考源码提交和哈希。已有容器不一定挂载 `/data`，可以用 docker cp 传入工具，或选择已挂载的私人目录，不要求重建 yjl。
+新服务器交付包为 B2Y 的 `deliveries/topk-950pr-tools-20261031-r3.zip`，只含辅助材料；解压后从 `START_HERE.md` 开始。包内 `SOURCE.json` 记录参考源码提交和哈希。实际环境为已有 yjl、镜像 Weekly 20260930、私人目录 `/home/y00937463`，已挂载 `/home:/home`；使用容器内 python3，不使用 Conda、不重建容器。
 
 默认容器内布局为：
 
 ```text
-/data/yjl/topk/
+/home/y00937463/
   TileOPs/   # git clone 个人 fork，分支 main
   tools/     # 从 B2Y topk-950pr/ 手动传入的文件
   runs/      # 每轮独立原始结果，留在服务器
@@ -23,10 +23,10 @@
 路径、设备号和环境可覆盖，以实际获准配置为准。宿主机执行 `docker exec -it yjl /bin/bash`，随后在容器内执行：
 
 ```bash
-git clone --branch main https://github.com/sgcg1/TileOPs.git /data/yjl/topk/TileOPs
-git -C /data/yjl/topk/TileOPs fetch origin --tags
-# 激活已准备好的私人 Python 环境，再加载手动传入的辅助配置。
-source /data/yjl/topk/tools/env.sh
+git clone --branch main https://github.com/sgcg1/TileOPs.git /home/y00937463/TileOPs
+git -C /home/y00937463/TileOPs fetch origin --tags
+# 使用容器内 Python；如镜像未加载CANN，先source实际toolkit环境脚本。
+source /home/y00937463/tools/env.sh
 bash "$TOPK_TOOLS/run.sh" preflight
 bash "$TOPK_TOOLS/run.sh" test
 ```
