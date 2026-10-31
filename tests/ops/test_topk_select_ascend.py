@@ -43,6 +43,10 @@ def _reference(scores, starts, ends, k):
         ((1, 2, 65536, 1), 1024, "random", False),
         ((1, 3, 8193, 2), 2048, "constant", False),
         ((1, 1, 65536, 1), 2048, "constant", False),
+        ((1, 1, 257, 1), 193, "special", False),
+        ((1, 1, 257, 1), 231, "special", False),
+        ((1, 1, 8193, 1), 2048, "half_boundaries", False),
+        ((1, 1, 8193, 1), 6144, "half_boundaries", False),
     ],
 )
 def test_ascend_topk(shape, k, kind, strided):
@@ -52,6 +56,34 @@ def test_ascend_topk(shape, k, kind, strided):
         scores = scores.round()
     elif kind == "constant":
         scores.zero_()
+    elif kind == "half_boundaries":
+        anchors = torch.tensor(
+            [
+                0.0,
+                2**-25,
+                2**-24,
+                2**-14,
+                1 - 2**-12,
+                1 + 2**-11,
+                65504.0,
+                65520.0,
+                torch.inf,
+                torch.nan,
+            ],
+            dtype=torch.float32,
+        )
+        anchors = torch.cat((anchors, -anchors))
+        raw = torch.stack(
+            (
+                torch.nextafter(anchors, torch.full_like(anchors, -torch.inf)),
+                anchors,
+                torch.nextafter(anchors, torch.full_like(anchors, torch.inf)),
+            ),
+            dim=1,
+        ).flatten()
+        scores = raw.repeat((scores.numel() + raw.numel() - 1) // raw.numel())[
+            : scores.numel()
+        ].reshape(shape)
     elif kind == "special":
         raw = torch.tensor(
             [

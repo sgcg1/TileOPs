@@ -17,8 +17,20 @@ def topk_select_ascend(R: int, N: int, K: int, W: int, G: int):
             magnitude > T.Cast(T.uint32, 0x7F800000), T.Cast(T.uint32, 0xFFFFFFFF), zeroed
         )
 
+    def coarse_byte(value):
+        bits = T.reinterpret(T.Cast(T.float16, value), T.uint16)
+        magnitude = bits & T.Cast(T.uint16, 0x7FFF)
+        ordered = T.if_then_else(
+            (bits & T.Cast(T.uint16, 0x8000)) != 0, ~bits, bits | T.Cast(T.uint16, 0x8000)
+        )
+        zeroed = T.if_then_else(magnitude == 0, T.Cast(T.uint16, 0x8000), ordered)
+        canonical = T.if_then_else(
+            magnitude > T.Cast(T.uint16, 0x7C00), T.Cast(T.uint16, 0xFFFF), zeroed
+        )
+        return T.Cast(T.int32, (canonical >> 8) & T.Cast(T.uint16, 255))
+
     M = 2048
-    rounds = 4
+    rounds = 5
 
     @T.prim_func
     def main(
@@ -34,7 +46,7 @@ def topk_select_ascend(R: int, N: int, K: int, W: int, G: int):
             state = T.alloc_shared((7,), T.int32)
             cached_key = T.alloc_shared((2, M), T.uint32)
             cached_index = T.alloc_shared((2, M), T.int32)
-            prefix = T.alloc_shared((2,), T.uint32)
+            prefix = T.alloc_shared((3,), T.uint32)
             tie_prefix = T.alloc_shared((128,), T.int32)
             for row_iter in T.serial(T.ceildiv(R, W)):
                 row = worker + row_iter * W
@@ -49,7 +61,7 @@ def topk_select_ascend(R: int, N: int, K: int, W: int, G: int):
                             )
                         for i in T.Parallel(7):
                             state[i] = 0
-                        for i in T.Parallel(2):
+                        for i in T.Parallel(3):
                             prefix[i] = 0
                     with T.SimtVF(threads=128):
                         for thread in T.Parallel(128):
@@ -82,14 +94,25 @@ def topk_select_ascend(R: int, N: int, K: int, W: int, G: int):
                                             and i < ends[row // G]
                                         ):
                                             value = x[row // G, i, row % G]
-                                            key = score_key(value)
+                                            key = T.if_then_else(
+                                                round == 0, T.Cast(T.uint32, 0), score_key(value)
+                                            )
                                             candidate = i
-                                            if (key & prefix[1]) == prefix[0]:
+                                            if (
+                                                (round == 0)
+                                                or (
+                                                    coarse_byte(value) == T.Cast(T.int32, prefix[2])
+                                                )
+                                            ) and (key & prefix[1]) == prefix[0]:
                                                 digit = T.alloc_var(T.int32)
-                                                digit = T.Cast(
-                                                    T.int32,
-                                                    (key >> (24 - (round) * 8))
-                                                    & T.Cast(T.uint32, 255),
+                                                digit = T.if_then_else(
+                                                    round == 0,
+                                                    coarse_byte(value),
+                                                    T.Cast(
+                                                        T.int32,
+                                                        (key >> (24 - T.max(round - 1, 0) * 8))
+                                                        & T.Cast(T.uint32, 255),
+                                                    ),
                                                 )
                                                 T.assume(digit >= 0)
                                                 T.assume(digit < 256)
@@ -106,7 +129,7 @@ def topk_select_ascend(R: int, N: int, K: int, W: int, G: int):
                                                 ]
                                                 digit_byte = T.alloc_var(T.uint8)
                                                 digit_byte = T.Cast(
-                                                    T.uint8, key >> (24 - (round) * 8)
+                                                    T.uint8, key >> (24 - T.max(round - 1, 0) * 8)
                                                 )
                                                 digit = T.Cast(T.int32, digit_byte)
                                                 T.assume(digit >= 0)
@@ -123,7 +146,7 @@ def topk_select_ascend(R: int, N: int, K: int, W: int, G: int):
                                                 ]
                                                 digit_byte = T.alloc_var(T.uint8)
                                                 digit_byte = T.Cast(
-                                                    T.uint8, key >> (24 - (round) * 8)
+                                                    T.uint8, key >> (24 - T.max(round - 1, 0) * 8)
                                                 )
                                                 digit = T.Cast(T.int32, digit_byte)
                                                 T.assume(digit >= 0)
@@ -164,14 +187,25 @@ def topk_select_ascend(R: int, N: int, K: int, W: int, G: int):
                                             and i < ends[row // G]
                                         ):
                                             value = x[row // G, i, row % G]
-                                            key = score_key(value)
+                                            key = T.if_then_else(
+                                                round == 0, T.Cast(T.uint32, 0), score_key(value)
+                                            )
                                             candidate = i
-                                            if (key & prefix[1]) == prefix[0]:
+                                            if (
+                                                (round == 0)
+                                                or (
+                                                    coarse_byte(value) == T.Cast(T.int32, prefix[2])
+                                                )
+                                            ) and (key & prefix[1]) == prefix[0]:
                                                 digit = T.alloc_var(T.int32)
-                                                digit = T.Cast(
-                                                    T.int32,
-                                                    (key >> (24 - (round) * 8))
-                                                    & T.Cast(T.uint32, 255),
+                                                digit = T.if_then_else(
+                                                    round == 0,
+                                                    coarse_byte(value),
+                                                    T.Cast(
+                                                        T.int32,
+                                                        (key >> (24 - T.max(round - 1, 0) * 8))
+                                                        & T.Cast(T.uint32, 255),
+                                                    ),
                                                 )
                                                 T.assume(digit >= 0)
                                                 T.assume(digit < 256)
@@ -196,7 +230,9 @@ def topk_select_ascend(R: int, N: int, K: int, W: int, G: int):
                                                         ] = candidate
                                                         cached_key[
                                                             round % 2, T.max(0, T.min(slot, M - 1))
-                                                        ] = key
+                                                        ] = T.if_then_else(
+                                                            round == 0, score_key(value), key
+                                                        )
                             else:
                                 if round % 2 == 0:
                                     for tile in T.serial(T.ceildiv(T.min(cached_count, M), 128)):
@@ -209,7 +245,7 @@ def topk_select_ascend(R: int, N: int, K: int, W: int, G: int):
                                                 ]
                                                 digit_byte = T.alloc_var(T.uint8)
                                                 digit_byte = T.Cast(
-                                                    T.uint8, key >> (24 - (round) * 8)
+                                                    T.uint8, key >> (24 - T.max(round - 1, 0) * 8)
                                                 )
                                                 digit = T.Cast(T.int32, digit_byte)
                                                 T.assume(digit >= 0)
@@ -247,7 +283,7 @@ def topk_select_ascend(R: int, N: int, K: int, W: int, G: int):
                                                 ]
                                                 digit_byte = T.alloc_var(T.uint8)
                                                 digit_byte = T.Cast(
-                                                    T.uint8, key >> (24 - (round) * 8)
+                                                    T.uint8, key >> (24 - T.max(round - 1, 0) * 8)
                                                 )
                                                 digit = T.Cast(T.int32, digit_byte)
                                                 T.assume(digit >= 0)
@@ -279,58 +315,60 @@ def topk_select_ascend(R: int, N: int, K: int, W: int, G: int):
                                 if thread == 0:
                                     state[1] = state[1] + state[4]
                                     if state[2] >= 0:
-                                        shift = 24 - round * 8
-                                        prefix[0] = prefix[0] | (
-                                            T.Cast(T.uint32, state[2]) << shift
-                                        )
-                                        prefix[1] = prefix[1] | (T.Cast(T.uint32, 255) << shift)
-                    if state[0] > 0:
-                        # Contiguous thread segments preserve ascending absolute-index tie selection.
-                        with T.SimtVF(threads=128):
-                            for thread in T.Parallel(128):
-                                count = T.alloc_var(T.int32)
-                                count = 0
-                                for offset in T.serial(T.ceildiv(N, 128)):
-                                    i = thread * T.ceildiv(N, 128) + offset
-                                    if (  # noqa: SIM102 -- guard the score load before evaluating its key
-                                        state[0] > 0
-                                        and i < N
-                                        and i >= starts[row // G]
-                                        and i < ends[row // G]
-                                    ):
-                                        if score_key(x[row // G, i, row % G]) == prefix[0]:
-                                            count = count + 1
-                                tie_prefix[thread] = count
-                        with T.SimtVF(threads=128):
-                            for thread in T.Parallel(128):
-                                if thread == 0:
-                                    base = T.alloc_var(T.int32)
-                                    value = T.alloc_var(T.int32)
-                                    base = 0
-                                    for i in T.serial(128):
-                                        value = tie_prefix[i]
-                                        tie_prefix[i] = base
-                                        base = base + value
-                        with T.SimtVF(threads=128):
-                            for thread in T.Parallel(128):
-                                position = T.alloc_var(T.int32)
-                                position = state[1] + tie_prefix[thread]
-                                for offset in T.serial(T.ceildiv(N, 128)):
-                                    i = thread * T.ceildiv(N, 128) + offset
-                                    if (  # noqa: SIM102 -- guard the score load before evaluating its key
-                                        state[0] > 0
-                                        and i < N
-                                        and i >= starts[row // G]
-                                        and i < ends[row // G]
-                                    ):
-                                        if score_key(x[row // G, i, row % G]) == prefix[0]:
-                                            if position < state[1] + state[0]:
-                                                out[row, position] = i
-                                            position = position + 1
-                        with T.SimtVF(threads=128):
-                            for thread in T.Parallel(128):
-                                if thread == 0:
-                                    state[1] = state[1] + state[0]
-                                    state[0] = 0
+                                        if round == 0:
+                                            prefix[2] = T.Cast(T.uint32, state[2])
+                                        else:
+                                            shift = 24 - (round - 1) * 8
+                                            prefix[0] = prefix[0] | (
+                                                T.Cast(T.uint32, state[2]) << shift
+                                            )
+                                            prefix[1] = prefix[1] | (T.Cast(T.uint32, 255) << shift)
+                    # Contiguous thread segments preserve ascending absolute-index tie selection.
+                    with T.SimtVF(threads=128):
+                        for thread in T.Parallel(128):
+                            count = T.alloc_var(T.int32)
+                            count = 0
+                            for offset in T.serial(T.ceildiv(N, 128)):
+                                i = thread * T.ceildiv(N, 128) + offset
+                                if (  # noqa: SIM102 -- guard the score load before evaluating its key
+                                    state[0] > 0
+                                    and i < N
+                                    and i >= starts[row // G]
+                                    and i < ends[row // G]
+                                ):
+                                    if score_key(x[row // G, i, row % G]) == prefix[0]:
+                                        count = count + 1
+                            tie_prefix[thread] = count
+                    with T.SimtVF(threads=128):
+                        for thread in T.Parallel(128):
+                            if thread == 0:
+                                base = T.alloc_var(T.int32)
+                                value = T.alloc_var(T.int32)
+                                base = 0
+                                for i in T.serial(128):
+                                    value = tie_prefix[i]
+                                    tie_prefix[i] = base
+                                    base = base + value
+                    with T.SimtVF(threads=128):
+                        for thread in T.Parallel(128):
+                            position = T.alloc_var(T.int32)
+                            position = state[1] + tie_prefix[thread]
+                            for offset in T.serial(T.ceildiv(N, 128)):
+                                i = thread * T.ceildiv(N, 128) + offset
+                                if (  # noqa: SIM102 -- guard the score load before evaluating its key
+                                    state[0] > 0
+                                    and i < N
+                                    and i >= starts[row // G]
+                                    and i < ends[row // G]
+                                ):
+                                    if score_key(x[row // G, i, row % G]) == prefix[0]:
+                                        if position < state[1] + state[0]:
+                                            out[row, position] = i
+                                        position = position + 1
+                    with T.SimtVF(threads=128):
+                        for thread in T.Parallel(128):
+                            if thread == 0:
+                                state[1] = state[1] + state[0]
+                                state[0] = 0
 
     return main
