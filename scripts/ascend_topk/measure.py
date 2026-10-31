@@ -25,7 +25,7 @@ def main():
         required=True,
     )
     parser.add_argument("--workers", type=int)
-    parser.add_argument("--chunk", type=int)
+    parser.add_argument("--threads", type=int, choices=[64, 128, 256])
     parser.add_argument("--samples", type=int, default=50)
     parser.add_argument("--profile-samples", type=int, default=10)
     args = parser.parse_args()
@@ -49,7 +49,7 @@ def measure(args):
     suffix = (
         args.case
         + (f"-w{args.workers}" if args.workers else "")
-        + (f"-c{args.chunk}" if args.chunk else "")
+        + (f"-t{args.threads}" if args.threads else "")
     )
     torch.npu.set_device(0)
     torch.manual_seed(20261030)
@@ -62,9 +62,11 @@ def measure(args):
     output = torch.empty((rows, k), device="npu", dtype=torch.int32)
     adapter = AscendTopKSelect(scores, k)
     workers = args.workers or adapter.config["workers"]
-    if args.workers or args.chunk:
-        extra = {"C": args.chunk} if args.chunk else {}
-        program = topk_select_ascend(rows, length, k, workers, 1, **extra)
+    threads = args.threads or adapter.config["threads"]
+    if args.workers or args.threads:
+        program = topk_select_ascend(
+            rows, length, k, workers, 1, COARSE=adapter.config["coarse"], H=threads
+        )
     else:
         program = adapter.program
     input_view = scores.reshape(rows, length, 1)
@@ -115,7 +117,8 @@ def measure(args):
         run()
         torch.npu.synchronize()
         prof.step()
-        for _ in range(args.profile_samples):
+        # Leave headroom for profiler startup; select a fixed chronological tail.
+        for _ in range(args.profile_samples + 10):
             run()
             torch.npu.synchronize()
         prof.step()
@@ -123,7 +126,13 @@ def measure(args):
     for path in profile_dir.rglob("kernel_details.csv"):
         with path.open() as handle:
             records.extend(csv.DictReader(handle))
-    assert len(records) == args.profile_samples, (len(records), args.profile_samples)
+    assert args.profile_samples <= len(records) <= args.profile_samples + 10, (
+        len(records),
+        args.profile_samples,
+    )
+    records.sort(key=lambda row: float(row["Start Time(us)"].strip()))
+    captured_records = len(records)
+    records = records[-args.profile_samples :]
     kernel_samples = [float(row["Duration(us)"]) for row in records]
     data = {
         "version": args.version,
@@ -131,9 +140,14 @@ def measure(args):
         "shape": [1, rows, length, 1],
         "k": k,
         "workers": workers,
-        "chunk": args.chunk or adapter.config.get("chunk"),
+        "threads": threads,
+        "coarse": adapter.config["coarse"],
         "input_sha256": digest.hexdigest(),
         "correctness": "all rows: bounds, uniqueness, exact FP32 threshold",
+        "kernel_source_path": str(
+            importlib.import_module("tileops._kernels.attention.topk_select_ascend").__file__
+        ),
+        "generated_source_sha256": hashlib.sha256(program.get_kernel_source().encode()).hexdigest(),
         "kernel_source_sha256": hashlib.sha256(
             Path(
                 importlib.import_module("tileops._kernels.attention.topk_select_ascend").__file__
@@ -147,6 +161,9 @@ def measure(args):
         "device": torch.npu.get_device_name(0),
         "physical_device": 1,
         "profile_path": str(profile_dir),
+        "profile_captured_records": captured_records,
+        "profile_launched_records": args.profile_samples + 10,
+        "profile_selection": "last requested samples in device timestamp order",
         "timing": "preallocated raw kernel; 10 warmups; independent device events and profiling",
     }
     (root / (suffix + ".json")).write_text(json.dumps(data, indent=2))

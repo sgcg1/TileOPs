@@ -14,11 +14,24 @@ class AscendTopKSelect:
         self.batch, self.queries, self.length, self.groups = scores.shape
         self.top_k = top_k
         rows = self.batch * self.queries * self.groups
-        # Conservative worker count; each worker reuses its UB across rows.
-        # This controls scheduling, not the number of physical Vector cores.
-        self.config = {"workers": min(rows, 32), "threads": 128, "candidate_capacity": 2048}
+        vector_cores = torch.npu.get_device_properties(scores.device).vector_core_num
+        # The measured long-axis K=1024 case benefits from exact radix directly.
+        self.config = {
+            "workers": min(rows, vector_cores),
+            "threads": 128,
+            "candidate_capacity": 2048,
+            "coarse": (self.length, top_k) != (65536, 1024),
+        }
         self.program = (
-            topk_select_ascend(rows, self.length, top_k, self.config["workers"], self.groups)
+            topk_select_ascend(
+                rows,
+                self.length,
+                top_k,
+                self.config["workers"],
+                self.groups,
+                COARSE=self.config["coarse"],
+                H=self.config["threads"],
+            )
             if rows
             else None
         )
