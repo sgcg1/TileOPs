@@ -29,6 +29,13 @@ def topk_select_ascend(R: int, N: int, K: int, W: int, G: int):
         )
         return T.Cast(T.int32, (canonical >> 8) & T.Cast(T.uint16, 255))
 
+    cache_row = G == 1 and N <= 16384
+
+    def load_score(x, local, row, index):
+        if cache_row:
+            return local[index]
+        return x[row // G, index, row % G]
+
     M = 2048
     rounds = 5
 
@@ -40,6 +47,7 @@ def topk_select_ascend(R: int, N: int, K: int, W: int, G: int):
         out: T.Tensor((R, K), T.int32),
     ):
         with T.Kernel(W) as worker:
+            row_scores = T.alloc_shared((N if cache_row else 1,), T.float32)
             hist = T.alloc_shared((257,), T.int32)
             # Remaining quota, committed output count, threshold, active count,
             # accepted count, previous candidate count, next candidate count.
@@ -51,6 +59,8 @@ def topk_select_ascend(R: int, N: int, K: int, W: int, G: int):
             for row_iter in T.serial(T.ceildiv(R, W)):
                 row = worker + row_iter * W
                 if row < R:
+                    if cache_row:
+                        T.copy(x[row, 0:N, 0], row_scores)
                     with T.SimtVF(threads=128):
                         for i in T.Parallel(K):
                             out[row, i] = T.if_then_else(
@@ -93,7 +103,7 @@ def topk_select_ascend(R: int, N: int, K: int, W: int, G: int):
                                             and i >= starts[row // G]
                                             and i < ends[row // G]
                                         ):
-                                            value = x[row // G, i, row % G]
+                                            value = load_score(x, row_scores, row, i)
                                             key = T.if_then_else(
                                                 round == 0, T.Cast(T.uint32, 0), score_key(value)
                                             )
@@ -186,7 +196,7 @@ def topk_select_ascend(R: int, N: int, K: int, W: int, G: int):
                                             and i >= starts[row // G]
                                             and i < ends[row // G]
                                         ):
-                                            value = x[row // G, i, row % G]
+                                            value = load_score(x, row_scores, row, i)
                                             key = T.if_then_else(
                                                 round == 0, T.Cast(T.uint32, 0), score_key(value)
                                             )
@@ -336,7 +346,7 @@ def topk_select_ascend(R: int, N: int, K: int, W: int, G: int):
                                     and i >= starts[row // G]
                                     and i < ends[row // G]
                                 ):
-                                    if score_key(x[row // G, i, row % G]) == prefix[0]:
+                                    if score_key(load_score(x, row_scores, row, i)) == prefix[0]:
                                         count = count + 1
                             tie_prefix[thread] = count
                     with T.SimtVF(threads=128):
@@ -361,7 +371,7 @@ def topk_select_ascend(R: int, N: int, K: int, W: int, G: int):
                                     and i >= starts[row // G]
                                     and i < ends[row // G]
                                 ):
-                                    if score_key(x[row // G, i, row % G]) == prefix[0]:
+                                    if score_key(load_score(x, row_scores, row, i)) == prefix[0]:
                                         if position < state[1] + state[0]:
                                             out[row, position] = i
                                         position = position + 1
