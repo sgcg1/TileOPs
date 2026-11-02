@@ -1,6 +1,16 @@
 # TopK阶段计时前的最小探针
 
-目的：验证当前主仓TileLang0.1.15/CANN9.3 Weekly上，设备计数器、完成屏障和观察开销是否适合后续阶段诊断。首次现场反馈见下，尚未建立有效阶段耗时。
+目的：验证当前主仓TileLang0.1.15/CANN9.3 Weekly上，设备计数器、完成屏障和观察开销是否适合后续阶段诊断。probe2已完成最小采样，摘要尺度检查通过；原始证据待复核，尚无TopK阶段耗时。
+
+## 最新现场反馈：probe2完成，原始证据待复核
+
+用户回传20261102-probe2摘要，status=completed、输出参考检查通过。8项工具SHA与发布提交6853356一致。报告称10个配置各50个事件样本，4个timed配置各50个counter样本；后处理入口检查全部通过。当前仅收到摘要，未独立检查逐样本或实际C++。
+
+1/16/64轮timed counter中位数分别0.615/8.807/35.140μs，完整事件中位数14.165500/17.214000/43.438999μs；空区间counter为0.092μs。64−16差分得到1004.118255ticks/μs，相对探针1000约定偏差+0.411826%。timed相对plain事件中位数变化分别+0.155550%、−0.295396%、−0.067867%；缺少离散度，不能据此声称零开销或加速。
+
+16−1差分却为8.192μs counter对3.048500μs事件，差分比2687.223ticks/μs。两者测量范围不同，不能直接据此否定counter，也不能只挑一致的大工作量差分宣称全范围校准。先读取原始分布和生成代码，再解释短任务偏差；不机械扣除空区间观察成本。
+
+完整数据、复算与限制已归档B2Y `experiments/topk/20261102-timer-probe2-summary/`。当前操作入口改为 `diagnostics/topk-timer-probe/EXPORT_COMPLETE.md`：更新B2Y后，只读导出现有probe-report.json和源码为一个文本，不编译、不运行NPU、不修改原实验。此前“尚无probe2结果”等叙述保留为当时状态。真实TopK阶段计时和最终版本接受均未完成。
 
 ## 首次现场反馈：源码顺序检查失败
 
@@ -40,6 +50,6 @@ CANN对950的文档值为1000 ticks/μs，与Aicore curFreq字段不同。10%偏
 
 只有通过审阅，才扩展为TopK每轮histogram、scan、compact、状态更新、tie阶段记录，并同时保存候选数量、溢出重扫信息。多worker的阶段时间不能直接相加当作墙钟耗时。额外屏障可能改变原流水，需要与无插桩版总耗时比较；仿真周期与设备耗时分开报告。
 
-本地验证范围为Python/Ruff、16项CPU解释、只读导出与后处理回归测试、文档Bash语法和文件哈希。本地未运行NPU；现场首次回传及其限制见上。当前先按INSPECT_SOURCE.md回传源码，计时方法仍未通过验证。
+原probe2发布前的本地验证范围为Python/Ruff、16项CPU解释、只读导出与后处理回归测试、文档Bash语法和文件哈希。本地未运行NPU。随后增加完整证据导出器及4项CPU回归，当前全部20项通过；现场最新进展和当前操作入口见文首，历史INSPECT_SOURCE.md仅用于probe1。
 
 参考：[GetSystemCycle的950换算与同步示例](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/API/ascendcopapi/docs/en/api/SIMD-API/basic_api/tool_interface/system_resources_and_variables/GetSystemCycle_ISASI.md)、[主仓Kernel prelude](https://github.com/tile-ai/tilelang/blob/main/tilelang/ascend/language/kernel.py)、[主仓诊断流程](https://github.com/tile-ai/tilelang/blob/main/.agents/skills/tilelang-ascend/references/profiling.md)。
