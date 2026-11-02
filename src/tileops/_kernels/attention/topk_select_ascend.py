@@ -289,7 +289,9 @@ def topk_select_ascend(
                                                     cached_key[0, T.max(0, T.min(slot, M - 1))] = score_key(
                                                         x[row // G, i, row % G]
                                                     )
-                            elif (round == 0) or (cached_count > M):
+                            # First-round cached compact above already consumed the row.
+                            # state[5] is zero in round 0, so the cached loops below are empty.
+                            if ((round == 0) and not CACHE_COARSE) or (cached_count > M):
                                 for tile in T.serial(T.ceildiv(N, H)):
                                     for lane in T.Parallel(H):
                                         i = tile * H + lane

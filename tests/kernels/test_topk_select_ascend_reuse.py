@@ -14,6 +14,8 @@ class DisableReuse(ast.NodeTransformer):
     def visit_If(self, node):
         if ast.unparse(node.test) in {"COARSE and REUSE_COARSE", "CACHE_COARSE", "CACHE_COARSE and round == 0"}:
             return [self.visit(n) for n in node.orelse]
+        if ast.unparse(node.test) == "round == 0 and (not CACHE_COARSE) or cached_count > M":
+            node.test = ast.parse("(round == 0) or (cached_count > M)", mode="eval").body
         return self.generic_visit(node)
 
     def visit_Assert(self, node):
