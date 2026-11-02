@@ -12,12 +12,17 @@ SOURCE = "src/tileops/_kernels/attention/topk_select_ascend.py"
 
 class DisableReuse(ast.NodeTransformer):
     def visit_If(self, node):
-        if ast.unparse(node.test) == "COARSE and REUSE_COARSE":
-            return []
+        if ast.unparse(node.test) in {"COARSE and REUSE_COARSE", "CACHE_COARSE", "CACHE_COARSE and round == 0"}:
+            return [self.visit(n) for n in node.orelse]
+        return self.generic_visit(node)
+
+    def visit_Assert(self, node):
+        if "CACHE_COARSE" in ast.unparse(node.test):
+            return None
         return self.generic_visit(node)
 
     def visit_IfExp(self, node):
-        if ast.unparse(node.test) == "COARSE and REUSE_COARSE":
+        if ast.unparse(node.test) in {"COARSE and REUSE_COARSE", "CACHE_COARSE", "CACHE_COARSE and round == 0"}:
             return self.visit(node.orelse)
         return self.generic_visit(node)
 
@@ -29,6 +34,10 @@ class ReuseSourceTest(unittest.TestCase):
         ))
         candidate = ast.parse((ROOT / SOURCE).read_text())
         function = next(n for n in candidate.body if isinstance(n, ast.FunctionDef))
+        self.assertEqual(function.args.args[-1].arg, "CACHE_COARSE")
+        self.assertIs(function.args.defaults[-1].value, False)
+        function.args.args.pop()
+        function.args.defaults.pop()
         self.assertEqual(function.args.args[-1].arg, "REUSE_COARSE")
         self.assertIs(function.args.defaults[-1].value, False)
         function.args.args.pop()

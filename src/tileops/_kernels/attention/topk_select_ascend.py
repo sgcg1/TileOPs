@@ -15,6 +15,7 @@ def topk_select_ascend(
     H: int = 128,
     PARALLEL_SCAN: bool = True,
     REUSE_COARSE: bool = False,
+    CACHE_COARSE: bool = False,
 ):
     def score_key(value):
         bits = T.reinterpret(value, T.uint32)
@@ -44,6 +45,9 @@ def topk_select_ascend(
             return 24 - T.max(round - 1, 0) * 8
         return 24 - round * 8
 
+    assert not CACHE_COARSE or (COARSE and not REUSE_COARSE), (
+        "Coarse cache requires COARSE=True and REUSE_COARSE=False"
+    )
     M = 2048
     rounds = 5 if COARSE else 4
     assert H in (64, 128, 256)
@@ -60,6 +64,8 @@ def topk_select_ascend(
         out: T.Tensor((R, K), T.int32),
     ):
         with T.Kernel(W) as worker:
+            if CACHE_COARSE:
+                coarse_cache = T.alloc_shared((N,), T.uint8)
             hist = T.alloc_shared((257,), T.int32)
             group_offsets = T.alloc_shared((16,), T.int32)
             local_prefix = T.alloc_shared((256,), T.int32)
@@ -153,6 +159,8 @@ def topk_select_ascend(
                                                 )
                                                 T.assume(digit >= 0)
                                                 T.assume(digit < 256)
+                                                if CACHE_COARSE and round == 0:
+                                                    coarse_cache[i] = T.Cast(T.uint8, digit)
                                                 T.atomic_add(hist[T.max(0, T.min(digit, 255))], 1)
                             else:
                                 if round % 2 == 0:
@@ -256,7 +264,32 @@ def topk_select_ascend(
                         with T.SimtVF(threads=H):
                             cached_count = T.alloc_var(T.int32)
                             cached_count = state[5]
-                            if (round == 0) or (cached_count > M):
+                            if CACHE_COARSE and round == 0:
+                                for tile in T.serial(T.ceildiv(N, H)):
+                                    for lane in T.Parallel(H):
+                                        i = tile * H + lane
+                                        if (
+                                            state[3] > 0
+                                            and i < N
+                                            and i >= starts[row // G]
+                                            and i < ends[row // G]
+                                        ):
+                                            digit = T.Cast(T.int32, coarse_cache[i])
+                                            if digit > state[2]:
+                                                pos = T.atomic_add(
+                                                    hist[T.max(0, T.min(digit, 255))],
+                                                    1, return_prev=True,
+                                                ) + state[1]
+                                                if pos < K:
+                                                    out[row, pos] = i
+                                            elif digit == state[2] and state[0] > 0:
+                                                slot = T.atomic_add(state[6], 1, return_prev=True)
+                                                if slot >= 0 and slot < M:
+                                                    cached_index[0, T.max(0, T.min(slot, M - 1))] = i
+                                                    cached_key[0, T.max(0, T.min(slot, M - 1))] = score_key(
+                                                        x[row // G, i, row % G]
+                                                    )
+                            elif (round == 0) or (cached_count > M):
                                 for tile in T.serial(T.ceildiv(N, H)):
                                     for lane in T.Parallel(H):
                                         i = tile * H + lane
