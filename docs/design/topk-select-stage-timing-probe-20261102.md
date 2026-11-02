@@ -1,5 +1,7 @@
 # TopK阶段计时前的最小探针
 
+> 2026-11-02后续更新：真实Decode stage1已完成并复核，首轮histogram/compact占已测区间约81%，完整插桩增加约3.65%事件时间。下文保留探针演进历史；当前性能分析和优先级见[后续优化路线复评](topk-select-optimization-roadmap-20261102.md)，原始阶段数据已归档B2Y。
+
 目的：验证当前主仓TileLang0.1.15/CANN9.3 Weekly上，设备计数器、完成屏障和观察开销是否适合后续阶段诊断。probe2完整证据已复核，具备进入单worker Decode诊断的基础；真实TopK阶段耗时及插桩适用性仍待现场验证。
 
 ## 最新进展：完整探针复核及Decode阶段工具
