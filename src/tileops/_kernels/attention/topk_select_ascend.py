@@ -14,6 +14,7 @@ def topk_select_ascend(
     COARSE: bool = True,
     H: int = 128,
     PARALLEL_SCAN: bool = True,
+    REUSE_COARSE: bool = False,
 ):
     def score_key(value):
         bits = T.reinterpret(value, T.uint32)
@@ -115,6 +116,9 @@ def topk_select_ascend(
                                             and i < ends[row // G]
                                         ):
                                             value = x[row // G, i, row % G]
+                                            if COARSE and REUSE_COARSE:
+                                                coarse = T.alloc_var(T.int32)
+                                                coarse = coarse_byte(value)
                                             key = T.if_then_else(
                                                 COARSE and round == 0,
                                                 T.Cast(T.uint32, 0),
@@ -125,13 +129,22 @@ def topk_select_ascend(
                                                 (not COARSE)
                                                 or (round == 0)
                                                 or (
-                                                    coarse_byte(value) == T.Cast(T.int32, prefix[2])
+                                                    (
+                                                        coarse
+                                                        if COARSE and REUSE_COARSE
+                                                        else coarse_byte(value)
+                                                    )
+                                                    == T.Cast(T.int32, prefix[2])
                                                 )
                                             ) and (key & prefix[1]) == prefix[0]:
                                                 digit = T.alloc_var(T.int32)
                                                 digit = T.if_then_else(
                                                     COARSE and round == 0,
-                                                    coarse_byte(value),
+                                                    (
+                                                        coarse
+                                                        if COARSE and REUSE_COARSE
+                                                        else coarse_byte(value)
+                                                    ),
                                                     T.Cast(
                                                         T.int32,
                                                         (key >> (byte_shift(round)))
@@ -254,6 +267,9 @@ def topk_select_ascend(
                                             and i < ends[row // G]
                                         ):
                                             value = x[row // G, i, row % G]
+                                            if COARSE and REUSE_COARSE:
+                                                coarse = T.alloc_var(T.int32)
+                                                coarse = coarse_byte(value)
                                             key = T.if_then_else(
                                                 COARSE and round == 0,
                                                 T.Cast(T.uint32, 0),
@@ -264,13 +280,22 @@ def topk_select_ascend(
                                                 (not COARSE)
                                                 or (round == 0)
                                                 or (
-                                                    coarse_byte(value) == T.Cast(T.int32, prefix[2])
+                                                    (
+                                                        coarse
+                                                        if COARSE and REUSE_COARSE
+                                                        else coarse_byte(value)
+                                                    )
+                                                    == T.Cast(T.int32, prefix[2])
                                                 )
                                             ) and (key & prefix[1]) == prefix[0]:
                                                 digit = T.alloc_var(T.int32)
                                                 digit = T.if_then_else(
                                                     COARSE and round == 0,
-                                                    coarse_byte(value),
+                                                    (
+                                                        coarse
+                                                        if COARSE and REUSE_COARSE
+                                                        else coarse_byte(value)
+                                                    ),
                                                     T.Cast(
                                                         T.int32,
                                                         (key >> (byte_shift(round)))
