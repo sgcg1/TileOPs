@@ -12,19 +12,21 @@ SOURCE = "src/tileops/_kernels/attention/topk_select_ascend.py"
 
 class DisableReuse(ast.NodeTransformer):
     def visit_If(self, node):
-        if ast.unparse(node.test) in {"COARSE and REUSE_COARSE", "CACHE_COARSE", "CACHE_COARSE and round == 0"}:
+        if ast.unparse(node.test) in {"COARSE and REUSE_COARSE", "CACHE_COARSE", "CACHE_COARSE and round == 0", "HIST_BANKS > 1 and round == 0"}:
             return [self.visit(n) for n in node.orelse]
         if ast.unparse(node.test) == "round == 0 and (not CACHE_COARSE) or cached_count > M":
             node.test = ast.parse("(round == 0) or (cached_count > M)", mode="eval").body
         return self.generic_visit(node)
 
     def visit_Assert(self, node):
-        if "CACHE_COARSE" in ast.unparse(node.test):
+        if "CACHE_COARSE" in ast.unparse(node.test) or "HIST_BANKS" in ast.unparse(node.test):
             return None
         return self.generic_visit(node)
 
     def visit_IfExp(self, node):
-        if ast.unparse(node.test) in {"COARSE and REUSE_COARSE", "CACHE_COARSE", "CACHE_COARSE and round == 0"}:
+        if ast.unparse(node.test) == "HIST_BANKS == 1":
+            return self.visit(node.body)
+        if ast.unparse(node.test) in {"COARSE and REUSE_COARSE", "CACHE_COARSE", "CACHE_COARSE and round == 0", "HIST_BANKS > 1 and round == 0"}:
             return self.visit(node.orelse)
         return self.generic_visit(node)
 
@@ -36,6 +38,10 @@ class ReuseSourceTest(unittest.TestCase):
         ))
         candidate = ast.parse((ROOT / SOURCE).read_text())
         function = next(n for n in candidate.body if isinstance(n, ast.FunctionDef))
+        self.assertEqual(function.args.args[-1].arg, "HIST_BANKS")
+        self.assertEqual(function.args.defaults[-1].value, 1)
+        function.args.args.pop()
+        function.args.defaults.pop()
         self.assertEqual(function.args.args[-1].arg, "CACHE_COARSE")
         self.assertIs(function.args.defaults[-1].value, False)
         function.args.args.pop()

@@ -16,6 +16,7 @@ def topk_select_ascend(
     PARALLEL_SCAN: bool = True,
     REUSE_COARSE: bool = False,
     CACHE_COARSE: bool = False,
+    HIST_BANKS: int = 1,
 ):
     def score_key(value):
         bits = T.reinterpret(value, T.uint32)
@@ -48,6 +49,10 @@ def topk_select_ascend(
     assert not CACHE_COARSE or (COARSE and not REUSE_COARSE), (
         "Coarse cache requires COARSE=True and REUSE_COARSE=False"
     )
+    assert HIST_BANKS in (1, 4)
+    assert HIST_BANKS == 1 or (not CACHE_COARSE and not REUSE_COARSE), (
+        "Sharded histogram is an independent experiment"
+    )
     M = 2048
     rounds = 5 if COARSE else 4
     assert H in (64, 128, 256)
@@ -66,7 +71,7 @@ def topk_select_ascend(
         with T.Kernel(W) as worker:
             if CACHE_COARSE:
                 coarse_cache = T.alloc_shared((N,), T.uint8)
-            hist = T.alloc_shared((257,), T.int32)
+            hist = T.alloc_shared((257 if HIST_BANKS == 1 else 257 + HIST_BANKS * 256,), T.int32)
             group_offsets = T.alloc_shared((16,), T.int32)
             local_prefix = T.alloc_shared((256,), T.int32)
             # Remaining quota, committed output count, threshold, active count,
@@ -99,7 +104,11 @@ def topk_select_ascend(
                                 )
                     for round in T.serial(rounds):
                         with T.SimtVF(threads=H):
-                            for i in T.Parallel(257):
+                            for i in T.Parallel(
+                                257 if HIST_BANKS == 1 else T.if_then_else(
+                                    round == 0, 257 + HIST_BANKS * 256, 257
+                                )
+                            ):
                                 hist[i] = 0
                             for thread in T.Parallel(H):
                                 if thread == 0:
@@ -161,7 +170,18 @@ def topk_select_ascend(
                                                 T.assume(digit < 256)
                                                 if CACHE_COARSE and round == 0:
                                                     coarse_cache[i] = T.Cast(T.uint8, digit)
-                                                T.atomic_add(hist[T.max(0, T.min(digit, 255))], 1)
+                                                T.atomic_add(
+                                                    hist[
+                                                        T.max(0, T.min(digit, 255))
+                                                        if HIST_BANKS == 1
+                                                        else T.if_then_else(
+                                                            round == 0,
+                                                            257 + (lane % HIST_BANKS) * 256
+                                                            + T.max(0, T.min(digit, 255)),
+                                                            T.max(0, T.min(digit, 255)),
+                                                        )
+                                                    ], 1,
+                                                )
                             else:
                                 if round % 2 == 0:
                                     for tile in T.serial(T.ceildiv(T.min(cached_count, M), H)):
@@ -197,6 +217,15 @@ def topk_select_ascend(
                                                 T.assume(digit >= 0)
                                                 T.assume(digit < 256)
                                                 T.atomic_add(hist[T.max(0, T.min(digit, 255))], 1)
+                        if HIST_BANKS > 1 and round == 0:
+                            # Bank producers finish before the reduction VF reads them.
+                            with T.SimtVF(threads=H):
+                                for bucket in T.Parallel(256):
+                                    total = T.alloc_var(T.int32)
+                                    total = 0
+                                    for bank in T.serial(HIST_BANKS):
+                                        total = total + hist[257 + bank * 256 + bucket]
+                                    hist[bucket] = total
                         if PARALLEL_SCAN:
                             # Keep producer and consumer work in separate VF regions.
                             with T.SimtVF(threads=H):
