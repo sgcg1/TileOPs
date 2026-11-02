@@ -5,6 +5,7 @@ import math
 from pathlib import Path
 import random
 import struct
+import subprocess
 from types import SimpleNamespace
 import unittest
 
@@ -63,13 +64,13 @@ def coarse(value):
     return key >> 8
 
 
-def run(values, start, end, p, reverse=False):
+def run(values, start, end, p, reverse=False, stable=False):
     def add(array, i, value):
         old = array[i]
         array[i] += value
         return old
 
-    base = dict(x=values, starts=[start], ends=[end], P=p, K=16,
+    base = dict(STABLE_TIE=stable, x=values, starts=[start], ends=[end], P=p, K=16,
                 meta=[-1] * 4, higher=[-1] * 256, out=[-1] * 16,
                 offsets=Matrix([[0, 0] for _ in range(p)]), candidate_scores=[0.] * 16,
                 candidate_indices=[0] * 16, final_state=[-1, -1],
@@ -113,14 +114,36 @@ class DecodePipelineTest(unittest.TestCase):
         for values in distributions:
             for start, end in [(0, 256), (9, 210), (11, 20), (20, 20), (30, 20)]:
                 for p in [2, 4]:
-                    for reverse in [False, True]:
-                        result, expected = run(values, start, end, p, reverse)
+                    for reverse, stable in [(False, False), (True, False), (False, True), (True, True)]:
+                        result, expected = run(values, start, end, p, reverse, stable)
                         if result["meta"][3] > 16 and result["meta"][1] < 16:
                             seen.add("small" if result["meta"][2] <= 16 else "overflow")
                         self.assertEqual(sorted(result["out"]), sorted(expected), (start, end, p))
                         self.assertEqual(result["final_state"], [0, min(16, max(0, end - start))])
 
         self.assertEqual(seen, {"small", "overflow"})
+
+    def test_disabled_finish_matches_measured_r1_ast(self):
+        class Disable(ast.NodeTransformer):
+            def visit_If(self, node):
+                if ast.unparse(node.test) == "STABLE_TIE":
+                    return []
+                return self.generic_visit(node)
+
+            def visit_IfExp(self, node):
+                if ast.unparse(node.test) == "STABLE_TIE":
+                    return self.visit(node.orelse)
+                return self.generic_visit(node)
+
+        raw = subprocess.check_output(["git", "show", "03c8f916:src/tileops/_kernels/attention/topk_select_decode_pipeline_ascend.py"], cwd=ROOT)
+        old = ast.parse(raw)
+        current = ast.parse(SOURCE.read_text())
+        finish = next(n for n in current.body if isinstance(n, ast.FunctionDef) and n.name == "decode_finish")
+        self.assertEqual(finish.args.args[0].arg, "STABLE_TIE")
+        self.assertIs(finish.args.defaults[0].value, False)
+        finish.args.args.clear()
+        finish.args.defaults.clear()
+        self.assertEqual(ast.dump(Disable().visit(current)), ast.dump(old))
 
     def test_helpers_match_production_ast(self):
         prod = ast.parse((ROOT / "src/tileops/_kernels/attention/topk_select_ascend.py").read_text())
