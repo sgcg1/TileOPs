@@ -1,5 +1,7 @@
 # TopKSelectFwdOp 昇腾 950PR 适配交接
 
+> 2026-11-02 按4.2.2第4项新增桶扫描候选：见 [scan-r1说明](topk-select-950pr-scan-20261102.md)。代码与现场验证工具已准备；新候选NPU正确性与性能尚待实测，未正式发布v0.1.4。
+
 > 后续同步方式已更新：见 `docs/topk-select-950pr-sync.md`。个人 fork main 管理代码，B2Y `topk-950pr/` 提供手动传入 yjl 容器的辅助工具。以下远端路径和 dirty 状态为交接时历史快照；候选已保存为 Git 提交，但仍未通过 v0.1.4 最终验收。
 
 > 2026-10-31 卡 0 恢复核查：见 `docs/design/topk-select-950pr-card0-resume-20261031.md`。个人 fork 候选在独立缓存下通过 14 项测试，已保存同轮 Decode 基线、实际二进制和负载频率证据；完整 Prefill 性能验收仍未完成。

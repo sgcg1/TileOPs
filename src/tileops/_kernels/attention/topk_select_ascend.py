@@ -5,7 +5,16 @@ import tilelang.ascend.language as T
 
 
 @tilelang.jit(target="ascend", out_idx=[])
-def topk_select_ascend(R: int, N: int, K: int, W: int, G: int, COARSE: bool = True, H: int = 128):
+def topk_select_ascend(
+    R: int,
+    N: int,
+    K: int,
+    W: int,
+    G: int,
+    COARSE: bool = True,
+    H: int = 128,
+    PARALLEL_SCAN: bool = True,
+):
     def score_key(value):
         bits = T.reinterpret(value, T.uint32)
         magnitude = bits & T.Cast(T.uint32, 0x7FFFFFFF)
@@ -47,6 +56,8 @@ def topk_select_ascend(R: int, N: int, K: int, W: int, G: int, COARSE: bool = Tr
     ):
         with T.Kernel(W) as worker:
             hist = T.alloc_shared((257,), T.int32)
+            group_offsets = T.alloc_shared((16,), T.int32)
+            local_prefix = T.alloc_shared((256,), T.int32)
             # Remaining quota, committed output count, threshold, active count,
             # accepted count, previous candidate count, next candidate count.
             state = T.alloc_shared((7,), T.int32)
@@ -161,27 +172,70 @@ def topk_select_ascend(R: int, N: int, K: int, W: int, G: int, COARSE: bool = Tr
                                                 T.assume(digit >= 0)
                                                 T.assume(digit < 256)
                                                 T.atomic_add(hist[T.max(0, T.min(digit, 255))], 1)
-                        with T.SimtVF(threads=H):
-                            for thread in T.Parallel(H):
-                                if thread == 0 and state[0] > 0:
+                        if PARALLEL_SCAN:
+                            # Keep producer and consumer work in separate VF regions.
+                            with T.SimtVF(threads=H):
+                                for group in T.Parallel(16):
                                     total = T.alloc_var(T.int32)
-                                    threshold = T.alloc_var(T.int32)
                                     total = 0
-                                    threshold = -1
-                                    for j in T.serial(256):
-                                        bucket = 255 - j
-                                        count = hist[bucket]
-                                        if total <= state[0] and total + count > state[0]:
-                                            threshold = bucket
-                                        hist[bucket] = total
-                                        total = total + count
-                                    state[2] = threshold
-                                    state[3] = total
-                                    if threshold >= 0:
-                                        state[4] = hist[threshold]
-                                    else:
+                                    for j in T.serial(16):
+                                        bucket = 255 - group * 16 - j
+                                        local_prefix[bucket] = total
+                                        total = total + hist[bucket]
+                                    group_offsets[group] = total
+                            with T.SimtVF(threads=H):
+                                for thread in T.Parallel(H):
+                                    if thread == 0 and state[0] > 0:
+                                        total = T.alloc_var(T.int32)
+                                        count = T.alloc_var(T.int32)
+                                        total = 0
+                                        for group in T.serial(16):
+                                            count = group_offsets[group]
+                                            group_offsets[group] = total
+                                            total = total + count
+                                        state[3] = total
                                         state[4] = total
-                                    state[0] = state[0] - state[4]
+                            with T.SimtVF(threads=H):
+                                for bucket in T.Parallel(256):
+                                    if state[0] > 0:
+                                        before = T.alloc_var(T.int32)
+                                        through = T.alloc_var(T.int32)
+                                        before = (
+                                            local_prefix[bucket]
+                                            + group_offsets[(255 - bucket) // 16]
+                                        )
+                                        through = before + hist[bucket]
+                                        hist[bucket] = before
+                                        # Only one nonempty bucket can contain the quota.
+                                        if before <= state[0] and through > state[0]:
+                                            state[2] = bucket
+                                            state[4] = before
+                            with T.SimtVF(threads=H):
+                                for thread in T.Parallel(H):
+                                    if thread == 0:
+                                        state[0] = state[0] - state[4]
+                        else:
+                            with T.SimtVF(threads=H):
+                                for thread in T.Parallel(H):
+                                    if thread == 0 and state[0] > 0:
+                                        total = T.alloc_var(T.int32)
+                                        threshold = T.alloc_var(T.int32)
+                                        total = 0
+                                        threshold = -1
+                                        for j in T.serial(256):
+                                            bucket = 255 - j
+                                            count = hist[bucket]
+                                            if total <= state[0] and total + count > state[0]:
+                                                threshold = bucket
+                                            hist[bucket] = total
+                                            total = total + count
+                                        state[2] = threshold
+                                        state[3] = total
+                                        if threshold >= 0:
+                                            state[4] = hist[threshold]
+                                        else:
+                                            state[4] = total
+                                        state[0] = state[0] - state[4]
                         with T.SimtVF(threads=H):
                             cached_count = T.alloc_var(T.int32)
                             cached_count = state[5]

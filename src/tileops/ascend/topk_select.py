@@ -21,6 +21,7 @@ class AscendTopKSelect:
             "threads": 128,
             "candidate_capacity": 2048,
             "coarse": (self.length, top_k) != (65536, 1024),
+            "parallel_scan": True,
         }
         self.program = (
             topk_select_ascend(
@@ -31,6 +32,7 @@ class AscendTopKSelect:
                 self.groups,
                 COARSE=self.config["coarse"],
                 H=self.config["threads"],
+                PARALLEL_SCAN=self.config["parallel_scan"],
             )
             if rows
             else None

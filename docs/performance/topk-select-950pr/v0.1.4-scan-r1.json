@@ -1,0 +1,24 @@
+{
+  "candidate": "v0.1.4-scan-r1",
+  "recorded_date": "2026-11-02",
+  "status": "CPU arithmetic and static checks only; NPU correctness and candidate performance pending",
+  "final_version_accepted": false,
+  "change": "Replace serial 256-bin scan with 16x16 grouped exclusive scan; retain serial ablation",
+  "before": {
+    "evidence_source": "Operator-pasted summary decode; raw evidence not independently inspected",
+    "tileops_commit": "252ad607e3a86e09f880baf785f982eca81060c2",
+    "shape": [1, 1, 16384, 1],
+    "k": 2048,
+    "workers": 1,
+    "threads": 128,
+    "coarse": true,
+    "npu_tests": {"tests": 14, "failures": 0, "errors": 0, "skipped": 0},
+    "input_sha256": "c59b9485e9750eaf04d4668934c0383510a15b2cc9365ef9c6c4b9eaf2bf7593",
+    "kernel_source_sha256": "70f8ca82ebc92238e8c916c7ea9a729481d291a498643a69dab954114a0f41a0",
+    "kernel_median_us": 199.463,
+    "event_median_us": 203.60500365495682,
+    "cann_kernel_median_us": 9.2215,
+    "performance_x_cann": 0.04623163193173672
+  },
+  "candidate_measurements": null
+}

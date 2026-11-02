@@ -8,6 +8,8 @@
 
 完整操作指南位于 B2Y 的 `topk-950pr/README.md`。
 
+2026-11-02 桶扫描优化候选的验证入口为 B2Y `topk-950pr/SCAN_OPTIMIZATION.md`：更新两个仓库、新建EVIDENCE，先完成CPU算术检查、14项NPU契约及两轮新旧扫描对照，再运行性能测量。源码说明见 `docs/design/topk-select-950pr-scan-20261102.md`，未发布正式v0.1.4标签。
+
 当前指南为 B2Y 的 `topk-950pr/START_HERE.md`（20261031-r4），在容器内 clone 后直接阅读，无需下载交付 ZIP。`SOURCE.json` 记录参考源码提交和哈希。实际环境为已有 yjl、镜像 Weekly 20260930、私人目录 `/home/y00937463`，已挂载 `/home:/home`；直接使用容器内 python3。
 
 默认容器内布局为：
