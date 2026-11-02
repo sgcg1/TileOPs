@@ -12,7 +12,7 @@ SOURCE = "src/tileops/_kernels/attention/topk_select_ascend.py"
 
 class DisableReuse(ast.NodeTransformer):
     def visit_If(self, node):
-        if ast.unparse(node.test) in {"COARSE and REUSE_COARSE", "CACHE_COARSE", "CACHE_COARSE and round == 0", "HIST_BANKS > 1 and round == 0"}:
+        if ast.unparse(node.test) in {"COARSE and REUSE_COARSE", "CACHE_COARSE", "CACHE_COARSE and round == 0", "HIST_BANKS > 1 and round == 0", "HIST_BANKS > 1"}:
             return [self.visit(n) for n in node.orelse]
         if ast.unparse(node.test) == "round == 0 and (not CACHE_COARSE) or cached_count > M":
             node.test = ast.parse("(round == 0) or (cached_count > M)", mode="eval").body
@@ -26,7 +26,7 @@ class DisableReuse(ast.NodeTransformer):
     def visit_IfExp(self, node):
         if ast.unparse(node.test) == "HIST_BANKS == 1":
             return self.visit(node.body)
-        if ast.unparse(node.test) in {"COARSE and REUSE_COARSE", "CACHE_COARSE", "CACHE_COARSE and round == 0", "HIST_BANKS > 1 and round == 0"}:
+        if ast.unparse(node.test) in {"COARSE and REUSE_COARSE", "CACHE_COARSE", "CACHE_COARSE and round == 0", "HIST_BANKS > 1 and round == 0", "HIST_BANKS > 1"}:
             return self.visit(node.orelse)
         return self.generic_visit(node)
 

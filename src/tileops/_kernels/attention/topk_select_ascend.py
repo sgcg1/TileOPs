@@ -169,18 +169,21 @@ def topk_select_ascend(
                                                 T.assume(digit < 256)
                                                 if CACHE_COARSE and round == 0:
                                                     coarse_cache[i] = T.Cast(T.uint8, digit)
-                                                T.atomic_add(
-                                                    hist[
-                                                        T.max(0, T.min(digit, 255))
-                                                        if HIST_BANKS == 1
-                                                        else T.if_then_else(
-                                                            round == 0,
-                                                            257 + (lane % HIST_BANKS) * 256
-                                                            + T.max(0, T.min(digit, 255)),
-                                                            T.max(0, T.min(digit, 255)),
-                                                        )
-                                                    ], 1,
+                                                if HIST_BANKS > 1:
+                                                    histogram_index = T.alloc_var(T.int32)
+                                                    histogram_index = (
+                                                T.max(0, T.min(digit, 255))
+                                                if HIST_BANKS == 1
+                                                else T.if_then_else(
+                                                    round == 0,
+                                                    257 + (lane % HIST_BANKS) * 256
+                                                    + T.max(0, T.min(digit, 255)),
+                                                    T.max(0, T.min(digit, 255)),
                                                 )
+                                                    )
+                                                    T.atomic_add(hist[histogram_index], 1)
+                                                else:
+                                                    T.atomic_add(hist[T.max(0, T.min(digit, 255))], 1)
                             else:
                                 if round % 2 == 0:
                                     for tile in T.serial(T.ceildiv(T.min(cached_count, M), H)):

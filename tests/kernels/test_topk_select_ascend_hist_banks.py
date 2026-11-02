@@ -21,6 +21,13 @@ LANGUAGE = SimpleNamespace(max=max, min=min, if_then_else=lambda c, a, b: a if c
 
 
 class BankHistogramTest(unittest.TestCase):
+    def test_atomic_index_has_no_conditional_call(self):
+        for node in ast.walk(TREE):
+            if isinstance(node, ast.Call) and ast.unparse(node.func) == "T.atomic_add":
+                self.assertFalse(any(isinstance(n, ast.Call)
+                                     and ast.unparse(n.func) == "T.if_then_else"
+                                     for n in ast.walk(node.args[0])))
+
     def test_parallel_extents_are_static(self):
         for node in ast.walk(TREE):
             if isinstance(node, ast.Call) and ast.unparse(node.func) == "T.Parallel":
