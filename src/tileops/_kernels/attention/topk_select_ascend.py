@@ -104,12 +104,11 @@ def topk_select_ascend(
                                 )
                     for round in T.serial(rounds):
                         with T.SimtVF(threads=H):
-                            for i in T.Parallel(
-                                257 if HIST_BANKS == 1 else T.if_then_else(
-                                    round == 0, 257 + HIST_BANKS * 256, 257
-                                )
-                            ):
+                            for i in T.Parallel(257):
                                 hist[i] = 0
+                            if HIST_BANKS > 1 and round == 0:
+                                for i in T.Parallel(HIST_BANKS * 256):
+                                    hist[257 + i] = 0
                             for thread in T.Parallel(H):
                                 if thread == 0:
                                     state[5] = state[6]
