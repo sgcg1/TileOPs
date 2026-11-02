@@ -64,13 +64,13 @@ def coarse(value):
     return key >> 8
 
 
-def run(values, start, end, p, reverse=False, stable=False):
+def run(values, start, end, p, reverse=False, stable=False, adaptive=False):
     def add(array, i, value):
         old = array[i]
         array[i] += value
         return old
 
-    base = dict(STABLE_TIE=stable, x=values, starts=[start], ends=[end], P=p, K=16,
+    base = dict(STABLE_TIE=stable, ADAPTIVE_TIE=adaptive, x=values, starts=[start], ends=[end], P=p, K=16,
                 meta=[-1] * 4, higher=[-1] * 256, out=[-1] * 16,
                 offsets=Matrix([[0, 0] for _ in range(p)]), candidate_scores=[0.] * 16,
                 candidate_indices=[0] * 16, final_state=[-1, -1],
@@ -110,12 +110,16 @@ class DecodePipelineTest(unittest.TestCase):
         small_boundary = [1000.] * 15 + [100.] * 10 + [0.] * 231
         rng.shuffle(small_boundary)
         distributions.append(small_boundary)
+        for boundary in [16, 17]:
+            edge = [1000.] * 15 + [100.] * boundary + [0.] * (241 - boundary)
+            rng.shuffle(edge)
+            distributions.append(edge)
         seen = set()
         for values in distributions:
             for start, end in [(0, 256), (9, 210), (11, 20), (20, 20), (30, 20)]:
                 for p in [2, 4]:
-                    for reverse, stable in [(False, False), (True, False), (False, True), (True, True)]:
-                        result, expected = run(values, start, end, p, reverse, stable)
+                    for reverse, stable, adaptive in [(a, b, c) for a in [False, True] for b, c in [(False, False), (True, False), (False, True)]]:
+                        result, expected = run(values, start, end, p, reverse, stable, adaptive)
                         if result["meta"][3] > 16 and result["meta"][1] < 16:
                             seen.add("small" if result["meta"][2] <= 16 else "overflow")
                         self.assertEqual(sorted(result["out"]), sorted(expected), (start, end, p))
@@ -125,13 +129,17 @@ class DecodePipelineTest(unittest.TestCase):
 
     def test_disabled_finish_matches_measured_r1_ast(self):
         class Disable(ast.NodeTransformer):
+            def visit_Assert(self, node):
+                if "ADAPTIVE_TIE" in ast.unparse(node):
+                    return None
+                return node
             def visit_If(self, node):
-                if ast.unparse(node.test) == "STABLE_TIE":
+                if ast.unparse(node.test) == "STABLE_TIE or ADAPTIVE_TIE":
                     return []
                 return self.generic_visit(node)
 
             def visit_IfExp(self, node):
-                if ast.unparse(node.test) == "STABLE_TIE":
+                if ast.unparse(node.test) in {"STABLE_TIE", "ADAPTIVE_TIE"}:
                     return self.visit(node.orelse)
                 return self.generic_visit(node)
 

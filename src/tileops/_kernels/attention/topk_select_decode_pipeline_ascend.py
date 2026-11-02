@@ -114,7 +114,8 @@ def decode_compact(P: int):
 
 
 @tilelang.jit(target="ascend", out_idx=[])
-def decode_finish(STABLE_TIE: bool = False):
+def decode_finish(STABLE_TIE: bool = False, ADAPTIVE_TIE: bool = False):
+    assert not (STABLE_TIE and ADAPTIVE_TIE)
     def score_key(value):
         bits = T.reinterpret(value, T.uint32)
         magnitude = bits & T.Cast(T.uint32, 2147483647)
@@ -138,7 +139,7 @@ def decode_finish(STABLE_TIE: bool = False):
              candidate_indices: T.Tensor((2048,), T.int32),
              out: T.Tensor((2048,), T.int32), final_state: T.Tensor((2,), T.int32)):
         with T.Kernel(1):
-            if STABLE_TIE:
+            if STABLE_TIE or ADAPTIVE_TIE:
                 tie_prefix = T.alloc_shared((128,), T.int32)
             keys = T.alloc_shared((2048,), T.uint32)
             indices = T.alloc_shared((2048,), T.int32)
@@ -162,7 +163,10 @@ def decode_finish(STABLE_TIE: bool = False):
                     if thread == 0:
                         state[0] = T.if_then_else(meta[3] > 2048, 2048 - meta[1], 0)
                         state[1] = meta[1]
-            for round in T.serial(4 if STABLE_TIE else 8):
+            for round in T.serial(
+                T.if_then_else(meta[2] <= 2048, 8, 4)
+                if ADAPTIVE_TIE else (4 if STABLE_TIE else 8)
+            ):
                 with T.SimtVF(threads=128):
                     for bucket in T.Parallel(256):
                         hist[bucket] = 0
@@ -276,44 +280,45 @@ def decode_finish(STABLE_TIE: bool = False):
                                 else:
                                     prefix[2] = prefix[2] | (T.Cast(T.uint32, state[2]) << (24 - (round - 4) * 8))
                                     prefix[3] = prefix[3] | (T.Cast(T.uint32, 255) << (24 - (round - 4) * 8))
-            if STABLE_TIE:
-                # Absolute-index segments avoid depending on compact's slot order.
-                with T.SimtVF(threads=128):
-                    for thread in T.Parallel(128):
-                        count = T.alloc_var(T.int32)
-                        count = 0
-                        for offset in T.serial(T.ceildiv(16384, 128)):
-                            i = thread * T.ceildiv(16384, 128) + offset
-                            if state[0] > 0 and i >= starts[0] and i < ends[0]:
-                                if score_key(x[i]) == prefix[0]:
-                                    count = count + 1
-                        tie_prefix[thread] = count
-                with T.SimtVF(threads=128):
-                    for thread in T.Parallel(128):
-                        if thread == 0:
-                            total = T.alloc_var(T.int32)
+            if STABLE_TIE or ADAPTIVE_TIE:
+                if (not ADAPTIVE_TIE) or meta[2] > 2048:
+                    # Absolute-index segments avoid depending on compact's slot order.
+                    with T.SimtVF(threads=128):
+                        for thread in T.Parallel(128):
                             count = T.alloc_var(T.int32)
-                            total = 0
-                            for i in T.serial(128):
-                                count = tie_prefix[i]
-                                tie_prefix[i] = total
-                                total = total + count
-                with T.SimtVF(threads=128):
-                    for thread in T.Parallel(128):
-                        position = T.alloc_var(T.int32)
-                        position = state[1] + tie_prefix[thread]
-                        for offset in T.serial(T.ceildiv(16384, 128)):
-                            i = thread * T.ceildiv(16384, 128) + offset
-                            if state[0] > 0 and i >= starts[0] and i < ends[0]:
-                                if score_key(x[i]) == prefix[0]:
-                                    if position < state[1] + state[0]:
-                                        out[position] = i
-                                    position = position + 1
-                with T.SimtVF(threads=128):
-                    for thread in T.Parallel(128):
-                        if thread == 0:
-                            state[1] = state[1] + state[0]
-                            state[0] = 0
+                            count = 0
+                            for offset in T.serial(T.ceildiv(16384, 128)):
+                                i = thread * T.ceildiv(16384, 128) + offset
+                                if state[0] > 0 and i >= starts[0] and i < ends[0]:
+                                    if score_key(x[i]) == prefix[0]:
+                                        count = count + 1
+                            tie_prefix[thread] = count
+                    with T.SimtVF(threads=128):
+                        for thread in T.Parallel(128):
+                            if thread == 0:
+                                total = T.alloc_var(T.int32)
+                                count = T.alloc_var(T.int32)
+                                total = 0
+                                for i in T.serial(128):
+                                    count = tie_prefix[i]
+                                    tie_prefix[i] = total
+                                    total = total + count
+                    with T.SimtVF(threads=128):
+                        for thread in T.Parallel(128):
+                            position = T.alloc_var(T.int32)
+                            position = state[1] + tie_prefix[thread]
+                            for offset in T.serial(T.ceildiv(16384, 128)):
+                                i = thread * T.ceildiv(16384, 128) + offset
+                                if state[0] > 0 and i >= starts[0] and i < ends[0]:
+                                    if score_key(x[i]) == prefix[0]:
+                                        if position < state[1] + state[0]:
+                                            out[position] = i
+                                        position = position + 1
+                    with T.SimtVF(threads=128):
+                        for thread in T.Parallel(128):
+                            if thread == 0:
+                                state[1] = state[1] + state[0]
+                                state[0] = 0
             with T.SimtVF(threads=128):
                 for i in T.Parallel(2):
                     final_state[i] = state[i]
