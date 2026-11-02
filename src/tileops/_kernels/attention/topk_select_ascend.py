@@ -46,6 +46,10 @@ def topk_select_ascend(
     M = 2048
     rounds = 5 if COARSE else 4
     assert H in (64, 128, 256)
+    assert not PARALLEL_SCAN or H == 128, (
+        "Grouped scan is restricted to H=128; H=256 failed device checks. "
+        "Use PARALLEL_SCAN=False for serial scan diagnostics."
+    )
 
     @T.prim_func
     def main(

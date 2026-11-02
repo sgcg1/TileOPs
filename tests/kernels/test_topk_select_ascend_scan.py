@@ -5,6 +5,7 @@ Run directly with Python. These checks do not validate VF lowering or synchroniz
 
 import ast
 import contextlib
+import copy
 import random
 import unittest
 from pathlib import Path
@@ -98,6 +99,26 @@ class ScanArithmeticTest(unittest.TestCase):
                 run_scan("parallel", counts, quota, 128),
                 run_scan("parallel", counts, quota, 128, reverse_parallel=True),
             )
+
+    def test_grouped_scan_configuration_guard(self):
+        class KernelDefinitionReachedError(Exception):
+            pass
+
+        class LanguageBoundary:
+            def __getattr__(self, name):
+                raise KernelDefinitionReachedError
+
+        function = copy.deepcopy(next(n for n in TREE.body if isinstance(n, ast.FunctionDef)))
+        function.decorator_list = []
+        namespace = {"T": LanguageBoundary()}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), str(KERNEL), "exec"), namespace)
+        build = namespace["topk_select_ascend"]
+        for threads in [64, 256]:
+            with self.assertRaisesRegex(AssertionError, "restricted to H=128"):
+                build(1, 16384, 2048, 1, 1, H=threads, PARALLEL_SCAN=True)
+        for threads, parallel in [(128, True), (128, False), (64, False), (256, False)]:
+            with self.assertRaises(KernelDefinitionReachedError):
+                build(1, 16384, 2048, 1, 1, H=threads, PARALLEL_SCAN=parallel)
 
 
 if __name__ == "__main__":
