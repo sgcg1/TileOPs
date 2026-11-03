@@ -4,7 +4,7 @@ import tilelang.ascend.language as T
 
 
 @tilelang.jit(target="ascend", out_idx=[])
-def decode_histogram(N: int, P: int):
+def decode_histogram(N: int, P: int, STAGE_INPUT: bool = False):
     assert N == 16384 and P in (1, 2, 4)
     def coarse_byte(value):
         bits = T.reinterpret(T.Cast(T.float16, value), T.uint16)
@@ -19,6 +19,9 @@ def decode_histogram(N: int, P: int):
              starts: T.Tensor((1,), T.int32), ends: T.Tensor((1,), T.int32),
              partial: T.Tensor((P, 256), T.int32)):
         with T.Kernel(P) as worker:
+            if STAGE_INPUT:
+                local_x = T.alloc_shared((N // P,), T.float32)
+                T.copy(x[worker * (N // P):(worker + 1) * (N // P)], local_x)
             hist = T.alloc_shared((256,), T.int32)
             with T.SimtVF(threads=128):
                 for bucket in T.Parallel(256):
@@ -29,7 +32,7 @@ def decode_histogram(N: int, P: int):
                         i = worker * (N // P) + tile * 128 + lane
                         if i >= starts[0] and i < ends[0]:
                             digit = T.alloc_var(T.int32)
-                            digit = coarse_byte(x[i])
+                            digit = coarse_byte(local_x[i - worker * (N // P)] if STAGE_INPUT else x[i])
                             T.assume(digit >= 0)
                             T.assume(digit < 256)
                             T.atomic_add(hist[T.max(0, T.min(digit, 255))], 1)
