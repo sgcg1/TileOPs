@@ -64,13 +64,13 @@ def coarse(value):
     return key >> 8
 
 
-def run(values, start, end, p, reverse=False, stable=False, adaptive=False, grouped=False, early=False, scan_width=128, stage_input=False, fuse_quota=False, skip_index_prefix=False):
+def run(values, start, end, p, reverse=False, stable=False, adaptive=False, grouped=False, early=False, scan_width=128, stage_input=False, fuse_quota=False, skip_index_prefix=False, stage_overflow=False):
     def add(array, i, value):
         old = array[i]
         array[i] += value
         return old
 
-    base = dict(SKIP_INDEX_PREFIX=skip_index_prefix, FUSE_QUOTA=fuse_quota, STAGE_INPUT=stage_input, SCAN_WIDTH={128: 8, 512: 32}[scan_width], EARLY_EXIT=early, GROUPED_OFFSETS=grouped, STABLE_TIE=stable, ADAPTIVE_TIE=adaptive, x=values, starts=[start], ends=[end], P=p, K=16,
+    base = dict(STAGE_OVERFLOW=stage_overflow, SKIP_INDEX_PREFIX=skip_index_prefix, FUSE_QUOTA=fuse_quota, STAGE_INPUT=stage_input, SCAN_WIDTH={128: 8, 512: 32}[scan_width], EARLY_EXIT=early, GROUPED_OFFSETS=grouped, STABLE_TIE=stable, ADAPTIVE_TIE=adaptive, x=values, starts=[start], ends=[end], P=p, K=16,
                 meta=[-1] * 4, higher=[-1] * 256, out=[-1] * 16,
                 offsets=Matrix([[0, 0] for _ in range(p)]), candidate_scores=[0.] * 16,
                 candidate_indices=[0] * 16, final_state=[-1, -1],
@@ -213,6 +213,25 @@ class DecodePipelineTest(unittest.TestCase):
         self.assertEqual({key >> 16 for key in keys}, {0xffff})
         self.assertTrue(all((a & 0xffff) > (b & 0xffff) for a, b in zip(keys, keys[1:])))
 
+    def test_overflow_staging_preserves_exact_selection(self):
+        rng = random.Random(49)
+        cases = [[rng.uniform(-1, 1) for _ in range(256)], [1.] * 256,
+                 [float("nan"), float("inf"), -float("inf"), 0., -0.] * 51 + [1.],
+                 [1000.] * 15 + [100.] * 16 + [0.] * 225,
+                 [1000.] * 15 + [100.] * 17 + [0.] * 224]
+        seen = set()
+        for values in cases:
+            for start, end in [(0, 256), (9, 210), (11, 20), (20, 20), (30, 20)]:
+                for reverse in [False, True]:
+                    old, expected = run(values, start, end, 4, reverse, adaptive=True, grouped=True, early=True, stage_input=True)
+                    new, _ = run(values, start, end, 4, reverse, adaptive=True, grouped=True, early=True, stage_input=True, stage_overflow=True)
+                    self.assertEqual(sorted(new["out"]), sorted(expected))
+                    self.assertEqual(new["final_state"], old["final_state"])
+                    seen.add(new["meta"][2] > 16)
+                    if new["meta"][2] <= 16:
+                        self.assertTrue(all(value == 0 for value in new["overflow_x"]))
+        self.assertEqual(seen, {False, True})
+
     def test_prepare_offsets_against_full_scale_oracle(self):
         prepare = next(n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == "decode_prepare")
         main = next(n for n in prepare.body if isinstance(n, ast.FunctionDef) and n.name == "main")
@@ -248,7 +267,7 @@ class DecodePipelineTest(unittest.TestCase):
                     return None
                 return node
             def visit_If(self, node):
-                if ast.unparse(node.test) in {"STABLE_TIE or ADAPTIVE_TIE", "GROUPED_OFFSETS", "STAGE_INPUT", "FUSE_QUOTA"}:
+                if ast.unparse(node.test) in {"STABLE_TIE or ADAPTIVE_TIE", "GROUPED_OFFSETS", "STAGE_INPUT", "FUSE_QUOTA", "STAGE_OVERFLOW"}:
                     return self.branch(node.orelse)
                 if ast.unparse(node.test) == "not SKIP_INDEX_PREFIX or round < 4 or round >= 6":
                     return self.branch(node.body)
@@ -259,7 +278,7 @@ class DecodePipelineTest(unittest.TestCase):
                 return self.generic_visit(node)
 
             def visit_IfExp(self, node):
-                if ast.unparse(node.test) in {"STABLE_TIE", "ADAPTIVE_TIE", "STAGE_INPUT"}:
+                if ast.unparse(node.test) in {"STABLE_TIE", "ADAPTIVE_TIE", "STAGE_INPUT", "STAGE_OVERFLOW"}:
                     return self.visit(node.orelse)
                 return self.generic_visit(node)
 
