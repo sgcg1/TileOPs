@@ -64,13 +64,13 @@ def coarse(value):
     return key >> 8
 
 
-def run(values, start, end, p, reverse=False, stable=False, adaptive=False):
+def run(values, start, end, p, reverse=False, stable=False, adaptive=False, grouped=False):
     def add(array, i, value):
         old = array[i]
         array[i] += value
         return old
 
-    base = dict(STABLE_TIE=stable, ADAPTIVE_TIE=adaptive, x=values, starts=[start], ends=[end], P=p, K=16,
+    base = dict(GROUPED_OFFSETS=grouped, STABLE_TIE=stable, ADAPTIVE_TIE=adaptive, x=values, starts=[start], ends=[end], P=p, K=16,
                 meta=[-1] * 4, higher=[-1] * 256, out=[-1] * 16,
                 offsets=Matrix([[0, 0] for _ in range(p)]), candidate_scores=[0.] * 16,
                 candidate_indices=[0] * 16, final_state=[-1, -1],
@@ -118,14 +118,34 @@ class DecodePipelineTest(unittest.TestCase):
         for values in distributions:
             for start, end in [(0, 256), (9, 210), (11, 20), (20, 20), (30, 20)]:
                 for p in [2, 4]:
-                    for reverse, stable, adaptive in [(a, b, c) for a in [False, True] for b, c in [(False, False), (True, False), (False, True)]]:
-                        result, expected = run(values, start, end, p, reverse, stable, adaptive)
+                    for reverse, stable, adaptive, grouped in [(a, b, c, g) for a in [False, True] for b, c in [(False, False), (True, False), (False, True)] for g in [False, True]]:
+                        result, expected = run(values, start, end, p, reverse, stable, adaptive, grouped)
                         if result["meta"][3] > 16 and result["meta"][1] < 16:
                             seen.add("small" if result["meta"][2] <= 16 else "overflow")
                         self.assertEqual(sorted(result["out"]), sorted(expected), (start, end, p))
                         self.assertEqual(result["final_state"], [0, min(16, max(0, end - start))])
 
         self.assertEqual(seen, {"small", "overflow"})
+
+    def test_prepare_offsets_against_full_scale_oracle(self):
+        prepare = next(n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == "decode_prepare")
+        main = next(n for n in prepare.body if isinstance(n, ast.FunctionDef) and n.name == "main")
+        actual = compile(ast.Module(body=main.body, type_ignores=[]), "full-prepare", "exec")
+        rng = random.Random(7)
+        for p in [1, 2, 4]:
+            for grouped in [False, True]:
+                values = [[rng.randrange(20) for _ in range(256)] for _ in range(p)]
+                language = SimpleNamespace(Kernel=lambda *args: contextlib.nullcontext(),
+                    SimtVF=lambda **kw: contextlib.nullcontext(), Parallel=range, serial=range,
+                    alloc_shared=lambda shape, dtype: [0] * shape[0], alloc_var=lambda dtype: 0,
+                    int32=int, max=max, min=min)
+                meta, offsets = [0] * 4, Matrix([[0, 0] for _ in range(p)])
+                exec(actual, dict(T=language, P=p, K=2048, GROUPED_OFFSETS=grouped,
+                                  partial=Matrix(values), meta=meta, higher=[0] * 256,
+                                  out=[0] * 2048, offsets=offsets))
+                for worker in range(p):
+                    self.assertEqual(offsets[worker, 0], sum(sum(row[meta[0] + 1:]) for row in values[:worker]))
+                    self.assertEqual(offsets[worker, 1], sum(row[meta[0]] for row in values[:worker]) if meta[0] >= 0 else 0)
 
     def test_disabled_finish_matches_measured_r1_ast(self):
         class Disable(ast.NodeTransformer):
@@ -134,8 +154,8 @@ class DecodePipelineTest(unittest.TestCase):
                     return None
                 return node
             def visit_If(self, node):
-                if ast.unparse(node.test) == "STABLE_TIE or ADAPTIVE_TIE":
-                    return []
+                if ast.unparse(node.test) in {"STABLE_TIE or ADAPTIVE_TIE", "GROUPED_OFFSETS"}:
+                    return [self.visit(n) for n in node.orelse]
                 return self.generic_visit(node)
 
             def visit_IfExp(self, node):
@@ -146,6 +166,11 @@ class DecodePipelineTest(unittest.TestCase):
         raw = subprocess.check_output(["git", "show", "03c8f916:src/tileops/_kernels/attention/topk_select_decode_pipeline_ascend.py"], cwd=ROOT)
         old = ast.parse(raw)
         current = ast.parse(SOURCE.read_text())
+        prepare = next(n for n in current.body if isinstance(n, ast.FunctionDef) and n.name == "decode_prepare")
+        self.assertEqual(prepare.args.args[-1].arg, "GROUPED_OFFSETS")
+        self.assertIs(prepare.args.defaults[-1].value, False)
+        prepare.args.args.pop()
+        prepare.args.defaults.pop()
         finish = next(n for n in current.body if isinstance(n, ast.FunctionDef) and n.name == "decode_finish")
         self.assertEqual(finish.args.args[0].arg, "STABLE_TIE")
         self.assertIs(finish.args.defaults[0].value, False)

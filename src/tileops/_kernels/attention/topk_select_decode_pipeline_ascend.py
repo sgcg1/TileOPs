@@ -4,12 +4,14 @@ import tilelang.ascend.language as T
 
 
 @tilelang.jit(target='ascend', out_idx=[])
-def decode_prepare(P: int, K: int=2048):
+def decode_prepare(P: int, K: int=2048, GROUPED_OFFSETS: bool = False):
     assert P in (1, 2, 4) and K == 2048
 
     @T.prim_func
     def main(partial: T.Tensor((P, 256), T.int32), higher: T.Tensor((256,), T.int32), meta: T.Tensor((4,), T.int32), out: T.Tensor((2048,), T.int32), offsets: T.Tensor((P, 2), T.int32)):
         with T.Kernel(1):
+            if GROUPED_OFFSETS:
+                accepted_groups = T.alloc_shared((P * 16,), T.int32)
             hist = T.alloc_shared((256,), T.int32)
             local_prefix = T.alloc_shared((256,), T.int32)
             groups = T.alloc_shared((16,), T.int32)
@@ -52,23 +54,52 @@ def decode_prepare(P: int, K: int=2048):
                         meta[0] = bucket
                         meta[1] = before
                         meta[2] = hist[bucket]
-            with T.SimtVF(threads=128):
-                for i in T.Parallel(2048):
-                    out[i] = 16384
-                for worker in T.Parallel(P):
-                    accepted = T.alloc_var(T.int32)
-                    boundary = T.alloc_var(T.int32)
-                    accepted = 0
-                    boundary = 0
-                    for previous in T.serial(P):
-                        if previous < worker:
-                            for bucket in T.serial(256):
-                                if bucket > meta[0]:
-                                    accepted = accepted + partial[previous, bucket]
-                            if meta[0] >= 0:
-                                boundary = boundary + partial[previous, T.max(0, T.min(meta[0], 255))]
-                    offsets[worker, 0] = accepted
-                    offsets[worker, 1] = boundary
+            if GROUPED_OFFSETS:
+                with T.SimtVF(threads=128):
+                    for i in T.Parallel(2048):
+                        out[i] = 16384
+                    for part_group in T.Parallel(P * 16):
+                        worker = part_group // 16
+                        group = part_group % 16
+                        accepted = T.alloc_var(T.int32)
+                        accepted = 0
+                        for j in T.serial(16):
+                            bucket = group * 16 + j
+                            if bucket > meta[0]:
+                                accepted = accepted + partial[worker, bucket]
+                        accepted_groups[part_group] = accepted
+                with T.SimtVF(threads=128):
+                    for worker in T.Parallel(P):
+                        accepted = T.alloc_var(T.int32)
+                        boundary = T.alloc_var(T.int32)
+                        accepted = 0
+                        boundary = 0
+                        for previous in T.serial(P):
+                            if previous < worker:
+                                for group in T.serial(16):
+                                    accepted = accepted + accepted_groups[previous * 16 + group]
+                                if meta[0] >= 0:
+                                    boundary = boundary + partial[previous, T.max(0, T.min(meta[0], 255))]
+                        offsets[worker, 0] = accepted
+                        offsets[worker, 1] = boundary
+            else:
+                with T.SimtVF(threads=128):
+                    for i in T.Parallel(2048):
+                        out[i] = 16384
+                    for worker in T.Parallel(P):
+                        accepted = T.alloc_var(T.int32)
+                        boundary = T.alloc_var(T.int32)
+                        accepted = 0
+                        boundary = 0
+                        for previous in T.serial(P):
+                            if previous < worker:
+                                for bucket in T.serial(256):
+                                    if bucket > meta[0]:
+                                        accepted = accepted + partial[previous, bucket]
+                                if meta[0] >= 0:
+                                    boundary = boundary + partial[previous, T.max(0, T.min(meta[0], 255))]
+                        offsets[worker, 0] = accepted
+                        offsets[worker, 1] = boundary
     return main
 
 
