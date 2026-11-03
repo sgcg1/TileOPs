@@ -149,10 +149,11 @@ def decode_compact(P: int, SCAN_WIDTH: int = 128, STAGE_INPUT: bool = False):
 
 
 @tilelang.jit(target="ascend", out_idx=[])
-def decode_finish(STABLE_TIE: bool = False, ADAPTIVE_TIE: bool = False, EARLY_EXIT: bool = False, FUSE_QUOTA: bool = False, SKIP_INDEX_PREFIX: bool = False, STAGE_OVERFLOW: bool = False, CACHE_OVERFLOW_KEYS: bool = False):
+def decode_finish(STABLE_TIE: bool = False, ADAPTIVE_TIE: bool = False, EARLY_EXIT: bool = False, FUSE_QUOTA: bool = False, SKIP_INDEX_PREFIX: bool = False, STAGE_OVERFLOW: bool = False, CACHE_OVERFLOW_KEYS: bool = False, CACHE_OVERFLOW_COARSE: bool = False):
     assert not (STABLE_TIE and ADAPTIVE_TIE)
     assert not STAGE_OVERFLOW or ADAPTIVE_TIE
     assert not CACHE_OVERFLOW_KEYS or (STAGE_OVERFLOW and ADAPTIVE_TIE)
+    assert not CACHE_OVERFLOW_COARSE or CACHE_OVERFLOW_KEYS
     def score_key(value):
         bits = T.reinterpret(value, T.uint32)
         magnitude = bits & T.Cast(T.uint32, 2147483647)
@@ -185,7 +186,13 @@ def decode_finish(STABLE_TIE: bool = False, ADAPTIVE_TIE: bool = False, EARLY_EX
                 if meta[2] > 2048:
                     with T.SimtVF(threads=128):
                         for i in T.Parallel(16384):
-                            overflow_keys[i] = score_key(overflow_x[i])
+                            if CACHE_OVERFLOW_COARSE:
+                                value = T.alloc_var(T.float32)
+                                value = overflow_x[i]
+                                overflow_keys[i] = score_key(value)
+                                overflow_x[i] = T.Cast(T.float32, coarse_byte(value))
+                            else:
+                                overflow_keys[i] = score_key(overflow_x[i])
             if STABLE_TIE or ADAPTIVE_TIE:
                 tie_prefix = T.alloc_shared((128,), T.int32)
             keys = T.alloc_shared((2048,), T.uint32)
@@ -242,7 +249,7 @@ def decode_finish(STABLE_TIE: bool = False, ADAPTIVE_TIE: bool = False, EARLY_EX
                                             absolute = j
                                             valid = 0
                                             if j >= starts[0] and j < ends[0]:
-                                                if coarse_byte(overflow_x[T.max(0, T.min(j, 16383))] if STAGE_OVERFLOW else x[j]) == meta[0]:
+                                                if (T.Cast(T.int32, overflow_x[T.max(0, T.min(j, 16383))]) if CACHE_OVERFLOW_COARSE else coarse_byte(overflow_x[T.max(0, T.min(j, 16383))] if STAGE_OVERFLOW else x[j])) == meta[0]:
                                                     value_key = overflow_keys[T.max(0, T.min(j, 16383))] if CACHE_OVERFLOW_KEYS else score_key(overflow_x[T.max(0, T.min(j, 16383))] if STAGE_OVERFLOW else x[j])
                                                     valid = 1
                                         if valid > 0:
@@ -306,7 +313,7 @@ def decode_finish(STABLE_TIE: bool = False, ADAPTIVE_TIE: bool = False, EARLY_EX
                                             absolute = j
                                             valid = 0
                                             if j >= starts[0] and j < ends[0]:
-                                                if coarse_byte(overflow_x[T.max(0, T.min(j, 16383))] if STAGE_OVERFLOW else x[j]) == meta[0]:
+                                                if (T.Cast(T.int32, overflow_x[T.max(0, T.min(j, 16383))]) if CACHE_OVERFLOW_COARSE else coarse_byte(overflow_x[T.max(0, T.min(j, 16383))] if STAGE_OVERFLOW else x[j])) == meta[0]:
                                                     value_key = overflow_keys[T.max(0, T.min(j, 16383))] if CACHE_OVERFLOW_KEYS else score_key(overflow_x[T.max(0, T.min(j, 16383))] if STAGE_OVERFLOW else x[j])
                                                     valid = 1
                                         if valid > 0:
