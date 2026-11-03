@@ -149,9 +149,10 @@ def decode_compact(P: int, SCAN_WIDTH: int = 128, STAGE_INPUT: bool = False):
 
 
 @tilelang.jit(target="ascend", out_idx=[])
-def decode_finish(STABLE_TIE: bool = False, ADAPTIVE_TIE: bool = False, EARLY_EXIT: bool = False, FUSE_QUOTA: bool = False, SKIP_INDEX_PREFIX: bool = False, STAGE_OVERFLOW: bool = False):
+def decode_finish(STABLE_TIE: bool = False, ADAPTIVE_TIE: bool = False, EARLY_EXIT: bool = False, FUSE_QUOTA: bool = False, SKIP_INDEX_PREFIX: bool = False, STAGE_OVERFLOW: bool = False, CACHE_OVERFLOW_KEYS: bool = False):
     assert not (STABLE_TIE and ADAPTIVE_TIE)
     assert not STAGE_OVERFLOW or ADAPTIVE_TIE
+    assert not CACHE_OVERFLOW_KEYS or (STAGE_OVERFLOW and ADAPTIVE_TIE)
     def score_key(value):
         bits = T.reinterpret(value, T.uint32)
         magnitude = bits & T.Cast(T.uint32, 2147483647)
@@ -179,6 +180,12 @@ def decode_finish(STABLE_TIE: bool = False, ADAPTIVE_TIE: bool = False, EARLY_EX
                 overflow_x = T.alloc_shared((16384,), T.float32)
                 if meta[2] > 2048:
                     T.copy(x, overflow_x)
+            if CACHE_OVERFLOW_KEYS:
+                overflow_keys = T.alloc_shared((16384,), T.uint32)
+                if meta[2] > 2048:
+                    with T.SimtVF(threads=128):
+                        for i in T.Parallel(16384):
+                            overflow_keys[i] = score_key(overflow_x[i])
             if STABLE_TIE or ADAPTIVE_TIE:
                 tie_prefix = T.alloc_shared((128,), T.int32)
             keys = T.alloc_shared((2048,), T.uint32)
@@ -236,7 +243,7 @@ def decode_finish(STABLE_TIE: bool = False, ADAPTIVE_TIE: bool = False, EARLY_EX
                                             valid = 0
                                             if j >= starts[0] and j < ends[0]:
                                                 if coarse_byte(overflow_x[T.max(0, T.min(j, 16383))] if STAGE_OVERFLOW else x[j]) == meta[0]:
-                                                    value_key = score_key(overflow_x[T.max(0, T.min(j, 16383))] if STAGE_OVERFLOW else x[j])
+                                                    value_key = overflow_keys[T.max(0, T.min(j, 16383))] if CACHE_OVERFLOW_KEYS else score_key(overflow_x[T.max(0, T.min(j, 16383))] if STAGE_OVERFLOW else x[j])
                                                     valid = 1
                                         if valid > 0:
                                             index_key = ~T.Cast(T.uint32, absolute)
@@ -300,7 +307,7 @@ def decode_finish(STABLE_TIE: bool = False, ADAPTIVE_TIE: bool = False, EARLY_EX
                                             valid = 0
                                             if j >= starts[0] and j < ends[0]:
                                                 if coarse_byte(overflow_x[T.max(0, T.min(j, 16383))] if STAGE_OVERFLOW else x[j]) == meta[0]:
-                                                    value_key = score_key(overflow_x[T.max(0, T.min(j, 16383))] if STAGE_OVERFLOW else x[j])
+                                                    value_key = overflow_keys[T.max(0, T.min(j, 16383))] if CACHE_OVERFLOW_KEYS else score_key(overflow_x[T.max(0, T.min(j, 16383))] if STAGE_OVERFLOW else x[j])
                                                     valid = 1
                                         if valid > 0:
                                             index_key = ~T.Cast(T.uint32, absolute)
@@ -337,7 +344,7 @@ def decode_finish(STABLE_TIE: bool = False, ADAPTIVE_TIE: bool = False, EARLY_EX
                                 for offset in T.serial(T.ceildiv(16384, 128)):
                                     i = thread * T.ceildiv(16384, 128) + offset
                                     if state[0] > 0 and i >= starts[0] and i < ends[0]:
-                                        if score_key(overflow_x[i] if STAGE_OVERFLOW else x[i]) == prefix[0]:
+                                        if (overflow_keys[i] if CACHE_OVERFLOW_KEYS else score_key(overflow_x[i] if STAGE_OVERFLOW else x[i])) == prefix[0]:
                                             count = count + 1
                                 tie_prefix[thread] = count
                         with T.SimtVF(threads=128):
@@ -357,7 +364,7 @@ def decode_finish(STABLE_TIE: bool = False, ADAPTIVE_TIE: bool = False, EARLY_EX
                                 for offset in T.serial(T.ceildiv(16384, 128)):
                                     i = thread * T.ceildiv(16384, 128) + offset
                                     if state[0] > 0 and i >= starts[0] and i < ends[0]:
-                                        if score_key(overflow_x[i] if STAGE_OVERFLOW else x[i]) == prefix[0]:
+                                        if (overflow_keys[i] if CACHE_OVERFLOW_KEYS else score_key(overflow_x[i] if STAGE_OVERFLOW else x[i])) == prefix[0]:
                                             if position < state[1] + state[0]:
                                                 out[position] = i
                                             position = position + 1
