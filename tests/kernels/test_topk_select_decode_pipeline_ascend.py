@@ -64,13 +64,13 @@ def coarse(value):
     return key >> 8
 
 
-def run(values, start, end, p, reverse=False, stable=False, adaptive=False, grouped=False, early=False, scan_width=128, stage_input=False, fuse_quota=False, skip_index_prefix=False, stage_overflow=False, cache_overflow_keys=False, cache_overflow_coarse=False):
+def run(values, start, end, p, reverse=False, stable=False, adaptive=False, grouped=False, early=False, scan_width=128, stage_input=False, fuse_quota=False, skip_index_prefix=False, stage_overflow=False, cache_overflow_keys=False, cache_overflow_coarse=False, window_precompute=False):
     def add(array, i, value):
         old = array[i]
         array[i] += value
         return old
 
-    base = dict(CACHE_OVERFLOW_COARSE=cache_overflow_coarse, CACHE_OVERFLOW_KEYS=cache_overflow_keys, STAGE_OVERFLOW=stage_overflow, SKIP_INDEX_PREFIX=skip_index_prefix, FUSE_QUOTA=fuse_quota, STAGE_INPUT=stage_input, SCAN_WIDTH={128: 8, 512: 32}[scan_width], EARLY_EXIT=early, GROUPED_OFFSETS=grouped, STABLE_TIE=stable, ADAPTIVE_TIE=adaptive, x=values, starts=[start], ends=[end], P=p, K=16,
+    base = dict(WINDOW_PRECOMPUTE=window_precompute, CACHE_OVERFLOW_COARSE=cache_overflow_coarse, CACHE_OVERFLOW_KEYS=cache_overflow_keys, STAGE_OVERFLOW=stage_overflow, SKIP_INDEX_PREFIX=skip_index_prefix, FUSE_QUOTA=fuse_quota, STAGE_INPUT=stage_input, SCAN_WIDTH={128: 8, 512: 32}[scan_width], EARLY_EXIT=early, GROUPED_OFFSETS=grouped, STABLE_TIE=stable, ADAPTIVE_TIE=adaptive, x=values, starts=[start], ends=[end], P=p, K=16,
                 meta=[-1] * 4, higher=[-1] * 256, out=[-1] * 16,
                 offsets=Matrix([[0, 0] for _ in range(p)]), candidate_scores=[0.] * 16,
                 candidate_indices=[0] * 16, final_state=[-1, -1],
@@ -270,6 +270,27 @@ class DecodePipelineTest(unittest.TestCase):
                     else:
                         self.assertTrue(all(value == 0 for value in new["overflow_x"]))
 
+    def test_window_limited_precompute(self):
+        rng = random.Random(79)
+        cases = [[rng.uniform(-1, 1) for _ in range(256)], [1.] * 256,
+                 [float("nan"), float("inf"), -float("inf"), 0., -0.] * 51 + [1.],
+                 [1. + (i % 4) / 64 for i in range(256)],
+                 [1. + i * 2**-22 for i in range(256)]]
+        for values in cases:
+            for start, end in [(0, 256), (9, 210), (11, 20), (20, 20), (30, 20)]:
+                for reverse in [False, True]:
+                    args = dict(adaptive=True, grouped=True, early=True, stage_input=True,
+                                stage_overflow=True, cache_overflow_keys=True, cache_overflow_coarse=True)
+                    old, expected = run(values, start, end, 4, reverse, **args)
+                    new, _ = run(values, start, end, 4, reverse, window_precompute=True, **args)
+                    self.assertEqual(sorted(new["out"]), sorted(expected))
+                    self.assertEqual(new["final_state"], old["final_state"])
+                    self.assertEqual(new["vf_calls"], old["vf_calls"])
+                    if new["meta"][2] > 16:
+                        self.assertEqual(new["overflow_keys"][start:end], [score(value) for value in values[start:end]])
+                        self.assertEqual(new["overflow_x"][start:end], [coarse(value) for value in values[start:end]])
+                        self.assertTrue(all(key == 0 for key in new["overflow_keys"][:start] + new["overflow_keys"][end:]))
+
     def test_prepare_offsets_against_full_scale_oracle(self):
         prepare = next(n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == "decode_prepare")
         main = next(n for n in prepare.body if isinstance(n, ast.FunctionDef) and n.name == "main")
@@ -301,12 +322,14 @@ class DecodePipelineTest(unittest.TestCase):
                 return result
 
             def visit_Assert(self, node):
-                if "ADAPTIVE_TIE" in ast.unparse(node) or "CACHE_OVERFLOW_COARSE" in ast.unparse(node):
+                if "ADAPTIVE_TIE" in ast.unparse(node) or "CACHE_OVERFLOW_COARSE" in ast.unparse(node) or "WINDOW_PRECOMPUTE" in ast.unparse(node):
                     return None
                 return node
             def visit_If(self, node):
                 if ast.unparse(node.test) in {"STABLE_TIE or ADAPTIVE_TIE", "GROUPED_OFFSETS", "STAGE_INPUT", "FUSE_QUOTA", "STAGE_OVERFLOW", "CACHE_OVERFLOW_KEYS", "CACHE_OVERFLOW_COARSE"}:
                     return self.branch(node.orelse)
+                if ast.unparse(node.test) == "not WINDOW_PRECOMPUTE or (i >= starts[0] and i < ends[0])":
+                    return self.branch(node.body)
                 if ast.unparse(node.test) == "not SKIP_INDEX_PREFIX or round < 4 or round >= 6":
                     return self.branch(node.body)
                 if ast.unparse(node.test) == "not FUSE_QUOTA":
