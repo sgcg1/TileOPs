@@ -64,13 +64,13 @@ def coarse(value):
     return key >> 8
 
 
-def run(values, start, end, p, reverse=False, stable=False, adaptive=False, grouped=False):
+def run(values, start, end, p, reverse=False, stable=False, adaptive=False, grouped=False, early=False):
     def add(array, i, value):
         old = array[i]
         array[i] += value
         return old
 
-    base = dict(GROUPED_OFFSETS=grouped, STABLE_TIE=stable, ADAPTIVE_TIE=adaptive, x=values, starts=[start], ends=[end], P=p, K=16,
+    base = dict(EARLY_EXIT=early, GROUPED_OFFSETS=grouped, STABLE_TIE=stable, ADAPTIVE_TIE=adaptive, x=values, starts=[start], ends=[end], P=p, K=16,
                 meta=[-1] * 4, higher=[-1] * 256, out=[-1] * 16,
                 offsets=Matrix([[0, 0] for _ in range(p)]), candidate_scores=[0.] * 16,
                 candidate_indices=[0] * 16, final_state=[-1, -1],
@@ -79,7 +79,12 @@ def run(values, start, end, p, reverse=False, stable=False, adaptive=False, grou
     for i in range(max(0, start), min(256, end)):
         counts[i // (256 // p)][coarse(values[i])] += 1
     base["partial"] = Matrix(counts)
-    language = SimpleNamespace(SimtVF=lambda **kw: contextlib.nullcontext(),
+    calls = [0]
+    def vf(**kw):
+        calls[0] += 1
+        return contextlib.nullcontext()
+    base["vf_calls"] = calls
+    language = SimpleNamespace(SimtVF=vf,
                                Kernel=lambda *args: contextlib.nullcontext(),
                                Parallel=(lambda n: reversed(range(n))) if reverse else range,
                                serial=range, alloc_shared=lambda shape, dtype: [0] * shape[0],
@@ -127,6 +132,22 @@ class DecodePipelineTest(unittest.TestCase):
 
         self.assertEqual(seen, {"small", "overflow"})
 
+    def test_early_exit_keeps_exact_sets(self):
+        rng = random.Random(9)
+        cases = [[rng.uniform(-1, 1) for _ in range(256)], [1.] * 256,
+                 [1000.] * 15 + [100.] * 16 + [0.] * 225]
+        for values in cases:
+            for start, end in [(0, 256), (11, 20), (20, 20), (30, 20)]:
+                for stable, adaptive in [(False, False), (True, False), (False, True)]:
+                    old, expected = run(values, start, end, 4, True, stable, adaptive, True)
+                    new, expected_new = run(values, start, end, 4, True, stable, adaptive, True, True)
+                    self.assertEqual(sorted(new["out"]), sorted(expected_new))
+                    self.assertEqual(sorted(old["out"]), sorted(new["out"]))
+                    self.assertEqual(new["final_state"], old["final_state"])
+                    self.assertLessEqual(new["vf_calls"][0], old["vf_calls"][0])
+                    if end - start <= 16:
+                        self.assertLess(new["vf_calls"][0], old["vf_calls"][0])
+
     def test_prepare_offsets_against_full_scale_oracle(self):
         prepare = next(n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == "decode_prepare")
         main = next(n for n in prepare.body if isinstance(n, ast.FunctionDef) and n.name == "main")
@@ -156,6 +177,8 @@ class DecodePipelineTest(unittest.TestCase):
             def visit_If(self, node):
                 if ast.unparse(node.test) in {"STABLE_TIE or ADAPTIVE_TIE", "GROUPED_OFFSETS"}:
                     return [self.visit(n) for n in node.orelse]
+                if ast.unparse(node.test) == "not EARLY_EXIT or state[0] > 0":
+                    return [self.visit(n) for n in node.body]
                 return self.generic_visit(node)
 
             def visit_IfExp(self, node):
