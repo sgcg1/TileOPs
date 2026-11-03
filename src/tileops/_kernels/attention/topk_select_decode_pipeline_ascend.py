@@ -235,8 +235,8 @@ def decode_finish(STABLE_TIE: bool = False, ADAPTIVE_TIE: bool = False, EARLY_EX
                                             absolute = j
                                             valid = 0
                                             if j >= starts[0] and j < ends[0]:
-                                                if coarse_byte(overflow_x[j] if STAGE_OVERFLOW else x[j]) == meta[0]:
-                                                    value_key = score_key(overflow_x[j] if STAGE_OVERFLOW else x[j])
+                                                if coarse_byte(overflow_x[T.max(0, T.min(j, 16383))] if STAGE_OVERFLOW else x[j]) == meta[0]:
+                                                    value_key = score_key(overflow_x[T.max(0, T.min(j, 16383))] if STAGE_OVERFLOW else x[j])
                                                     valid = 1
                                         if valid > 0:
                                             index_key = ~T.Cast(T.uint32, absolute)
@@ -299,8 +299,8 @@ def decode_finish(STABLE_TIE: bool = False, ADAPTIVE_TIE: bool = False, EARLY_EX
                                             absolute = j
                                             valid = 0
                                             if j >= starts[0] and j < ends[0]:
-                                                if coarse_byte(overflow_x[j] if STAGE_OVERFLOW else x[j]) == meta[0]:
-                                                    value_key = score_key(overflow_x[j] if STAGE_OVERFLOW else x[j])
+                                                if coarse_byte(overflow_x[T.max(0, T.min(j, 16383))] if STAGE_OVERFLOW else x[j]) == meta[0]:
+                                                    value_key = score_key(overflow_x[T.max(0, T.min(j, 16383))] if STAGE_OVERFLOW else x[j])
                                                     valid = 1
                                         if valid > 0:
                                             index_key = ~T.Cast(T.uint32, absolute)

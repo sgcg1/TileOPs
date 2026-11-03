@@ -16,7 +16,7 @@ TREE = ast.parse(SOURCE.read_text())
 
 class Lower(ast.NodeTransformer):
     def visit_Constant(self, node):
-        return ast.copy_location(ast.Constant({16384: 256, 2048: 16, 2047: 15, 128: 8}.get(node.value, node.value)), node)
+        return ast.copy_location(ast.Constant({16384: 256, 16383: 255, 2048: 16, 2047: 15, 128: 8}.get(node.value, node.value)), node)
 
     def visit_Call(self, node):
         if ast.unparse(node.func) == "T.atomic_add":
