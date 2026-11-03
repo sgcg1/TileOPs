@@ -104,8 +104,9 @@ def decode_prepare(P: int, K: int=2048, GROUPED_OFFSETS: bool = False):
 
 
 @tilelang.jit(target="ascend", out_idx=[])
-def decode_compact(P: int):
+def decode_compact(P: int, SCAN_WIDTH: int = 128):
     assert P in (2, 4)
+    assert SCAN_WIDTH in (128, 512)
     def coarse_byte(value):
         bits = T.reinterpret(T.Cast(T.float16, value), T.uint16)
         magnitude = bits & T.Cast(T.uint16, 32767)
@@ -126,9 +127,9 @@ def decode_compact(P: int):
                 for i in T.Parallel(2):
                     cursors[i] = 0
             with T.SimtVF(threads=128):
-                for tile in T.serial(16384 // P // 128):
-                    for lane in T.Parallel(128):
-                        i = worker * (16384 // P) + tile * 128 + lane
+                for tile in T.serial(16384 // P // SCAN_WIDTH):
+                    for lane in T.Parallel(SCAN_WIDTH):
+                        i = worker * (16384 // P) + tile * SCAN_WIDTH + lane
                         if i >= starts[0] and i < ends[0]:
                             digit = T.alloc_var(T.int32)
                             digit = coarse_byte(x[i])

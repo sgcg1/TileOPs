@@ -64,13 +64,13 @@ def coarse(value):
     return key >> 8
 
 
-def run(values, start, end, p, reverse=False, stable=False, adaptive=False, grouped=False, early=False):
+def run(values, start, end, p, reverse=False, stable=False, adaptive=False, grouped=False, early=False, scan_width=128):
     def add(array, i, value):
         old = array[i]
         array[i] += value
         return old
 
-    base = dict(EARLY_EXIT=early, GROUPED_OFFSETS=grouped, STABLE_TIE=stable, ADAPTIVE_TIE=adaptive, x=values, starts=[start], ends=[end], P=p, K=16,
+    base = dict(SCAN_WIDTH={128: 8, 512: 32}[scan_width], EARLY_EXIT=early, GROUPED_OFFSETS=grouped, STABLE_TIE=stable, ADAPTIVE_TIE=adaptive, x=values, starts=[start], ends=[end], P=p, K=16,
                 meta=[-1] * 4, higher=[-1] * 256, out=[-1] * 16,
                 offsets=Matrix([[0, 0] for _ in range(p)]), candidate_scores=[0.] * 16,
                 candidate_indices=[0] * 16, final_state=[-1, -1],
@@ -148,6 +148,22 @@ class DecodePipelineTest(unittest.TestCase):
                     if end - start <= 16:
                         self.assertLess(new["vf_calls"][0], old["vf_calls"][0])
 
+    def test_wide_compact_preserves_selection(self):
+        rng = random.Random(11)
+        cases = [[rng.uniform(-1, 1) for _ in range(256)], [1.] * 256,
+                 [float("nan"), float("inf"), -float("inf"), 0., -0.] * 51 + [1.],
+                 [1000.] * 15 + [100.] * 16 + [0.] * 225,
+                 [1000.] * 15 + [100.] * 17 + [0.] * 224]
+        for values in cases:
+            for start, end in [(0, 256), (9, 210), (11, 20), (20, 20), (30, 20)]:
+                for p in [2, 4]:
+                    for reverse in [False, True]:
+                        old, expected = run(values, start, end, p, reverse, adaptive=True, grouped=True, early=True)
+                        new, _ = run(values, start, end, p, reverse, adaptive=True, grouped=True, early=True, scan_width=512)
+                        self.assertEqual(sorted(new["out"]), sorted(expected))
+                        self.assertEqual(sorted(new["out"]), sorted(old["out"]))
+                        self.assertEqual(new["final_state"], old["final_state"])
+
     def test_prepare_offsets_against_full_scale_oracle(self):
         prepare = next(n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == "decode_prepare")
         main = next(n for n in prepare.body if isinstance(n, ast.FunctionDef) and n.name == "main")
@@ -194,6 +210,14 @@ class DecodePipelineTest(unittest.TestCase):
         self.assertIs(prepare.args.defaults[-1].value, False)
         prepare.args.args.pop()
         prepare.args.defaults.pop()
+        compact = next(n for n in current.body if isinstance(n, ast.FunctionDef) and n.name == "decode_compact")
+        compact.args.args.pop()
+        compact.args.defaults.pop()
+        compact.body = [n for n in compact.body if not (isinstance(n, ast.Assert) and "SCAN_WIDTH" in ast.unparse(n))]
+        class Narrow(ast.NodeTransformer):
+            def visit_Name(self, node):
+                return ast.copy_location(ast.Constant(128), node) if node.id == "SCAN_WIDTH" else node
+        Narrow().visit(compact)
         finish = next(n for n in current.body if isinstance(n, ast.FunctionDef) and n.name == "decode_finish")
         self.assertEqual(finish.args.args[0].arg, "STABLE_TIE")
         self.assertIs(finish.args.defaults[0].value, False)
