@@ -104,7 +104,7 @@ def decode_prepare(P: int, K: int=2048, GROUPED_OFFSETS: bool = False):
 
 
 @tilelang.jit(target="ascend", out_idx=[])
-def decode_compact(P: int, SCAN_WIDTH: int = 128):
+def decode_compact(P: int, SCAN_WIDTH: int = 128, STAGE_INPUT: bool = False):
     assert P in (2, 4)
     assert SCAN_WIDTH in (128, 512)
     def coarse_byte(value):
@@ -122,6 +122,9 @@ def decode_compact(P: int, SCAN_WIDTH: int = 128):
              candidate_scores: T.Tensor((2048,), T.float32),
              candidate_indices: T.Tensor((2048,), T.int32), out: T.Tensor((2048,), T.int32)):
         with T.Kernel(P) as worker:
+            if STAGE_INPUT:
+                local_x = T.alloc_shared((16384 // P,), T.float32)
+                T.copy(x[worker * (16384 // P):(worker + 1) * (16384 // P)], local_x)
             cursors = T.alloc_shared((2,), T.int32)
             with T.SimtVF(threads=128):
                 for i in T.Parallel(2):
@@ -132,7 +135,7 @@ def decode_compact(P: int, SCAN_WIDTH: int = 128):
                         i = worker * (16384 // P) + tile * SCAN_WIDTH + lane
                         if i >= starts[0] and i < ends[0]:
                             digit = T.alloc_var(T.int32)
-                            digit = coarse_byte(x[i])
+                            digit = coarse_byte(local_x[i - worker * (16384 // P)] if STAGE_INPUT else x[i])
                             if digit > meta[0]:
                                 pos = T.atomic_add(cursors[0], 1, return_prev=True) + offsets[worker, 0]
                                 if pos >= 0 and pos < 2048:
@@ -140,7 +143,7 @@ def decode_compact(P: int, SCAN_WIDTH: int = 128):
                             elif digit == meta[0]:
                                 slot = T.atomic_add(cursors[1], 1, return_prev=True) + offsets[worker, 1]
                                 if slot >= 0 and slot < 2048:
-                                    candidate_scores[slot] = x[i]
+                                    candidate_scores[slot] = local_x[i - worker * (16384 // P)] if STAGE_INPUT else x[i]
                                     candidate_indices[slot] = i
     return main
 

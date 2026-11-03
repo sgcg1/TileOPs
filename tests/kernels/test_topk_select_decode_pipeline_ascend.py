@@ -64,13 +64,13 @@ def coarse(value):
     return key >> 8
 
 
-def run(values, start, end, p, reverse=False, stable=False, adaptive=False, grouped=False, early=False, scan_width=128):
+def run(values, start, end, p, reverse=False, stable=False, adaptive=False, grouped=False, early=False, scan_width=128, stage_input=False):
     def add(array, i, value):
         old = array[i]
         array[i] += value
         return old
 
-    base = dict(SCAN_WIDTH={128: 8, 512: 32}[scan_width], EARLY_EXIT=early, GROUPED_OFFSETS=grouped, STABLE_TIE=stable, ADAPTIVE_TIE=adaptive, x=values, starts=[start], ends=[end], P=p, K=16,
+    base = dict(STAGE_INPUT=stage_input, SCAN_WIDTH={128: 8, 512: 32}[scan_width], EARLY_EXIT=early, GROUPED_OFFSETS=grouped, STABLE_TIE=stable, ADAPTIVE_TIE=adaptive, x=values, starts=[start], ends=[end], P=p, K=16,
                 meta=[-1] * 4, higher=[-1] * 256, out=[-1] * 16,
                 offsets=Matrix([[0, 0] for _ in range(p)]), candidate_scores=[0.] * 16,
                 candidate_indices=[0] * 16, final_state=[-1, -1],
@@ -88,7 +88,8 @@ def run(values, start, end, p, reverse=False, stable=False, adaptive=False, grou
                                Kernel=lambda *args: contextlib.nullcontext(),
                                Parallel=(lambda n: reversed(range(n))) if reverse else range,
                                serial=range, alloc_shared=lambda shape, dtype: [0] * shape[0],
-                               alloc_var=lambda dtype: 0, int32="int32", uint32="uint32",
+                               alloc_var=lambda dtype: 0, int32="int32", uint32="uint32", float32="float32",
+                               copy=lambda source, target: target.__setitem__(slice(None), source),
                                Cast=lambda dtype, x: int(x) & 0xffffffff if dtype == "uint32" else int(x),
                                if_then_else=lambda c, a, b: a if c else b,
                                max=max, min=min, assume=lambda cond: None,
@@ -159,10 +160,11 @@ class DecodePipelineTest(unittest.TestCase):
                 for p in [2, 4]:
                     for reverse in [False, True]:
                         old, expected = run(values, start, end, p, reverse, adaptive=True, grouped=True, early=True)
-                        new, _ = run(values, start, end, p, reverse, adaptive=True, grouped=True, early=True, scan_width=512)
-                        self.assertEqual(sorted(new["out"]), sorted(expected))
-                        self.assertEqual(sorted(new["out"]), sorted(old["out"]))
-                        self.assertEqual(new["final_state"], old["final_state"])
+                        for width in [128, 512]:
+                            new, _ = run(values, start, end, p, reverse, adaptive=True, grouped=True, early=True, scan_width=width, stage_input=True)
+                            self.assertEqual(sorted(new["out"]), sorted(expected))
+                            self.assertEqual(sorted(new["out"]), sorted(old["out"]))
+                            self.assertEqual(new["final_state"], old["final_state"])
 
     def test_prepare_offsets_against_full_scale_oracle(self):
         prepare = next(n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == "decode_prepare")
@@ -191,14 +193,14 @@ class DecodePipelineTest(unittest.TestCase):
                     return None
                 return node
             def visit_If(self, node):
-                if ast.unparse(node.test) in {"STABLE_TIE or ADAPTIVE_TIE", "GROUPED_OFFSETS"}:
+                if ast.unparse(node.test) in {"STABLE_TIE or ADAPTIVE_TIE", "GROUPED_OFFSETS", "STAGE_INPUT"}:
                     return [self.visit(n) for n in node.orelse]
                 if ast.unparse(node.test) == "not EARLY_EXIT or state[0] > 0":
                     return [self.visit(n) for n in node.body]
                 return self.generic_visit(node)
 
             def visit_IfExp(self, node):
-                if ast.unparse(node.test) in {"STABLE_TIE", "ADAPTIVE_TIE"}:
+                if ast.unparse(node.test) in {"STABLE_TIE", "ADAPTIVE_TIE", "STAGE_INPUT"}:
                     return self.visit(node.orelse)
                 return self.generic_visit(node)
 
@@ -211,6 +213,8 @@ class DecodePipelineTest(unittest.TestCase):
         prepare.args.args.pop()
         prepare.args.defaults.pop()
         compact = next(n for n in current.body if isinstance(n, ast.FunctionDef) and n.name == "decode_compact")
+        compact.args.args.pop()
+        compact.args.defaults.pop()
         compact.args.args.pop()
         compact.args.defaults.pop()
         compact.body = [n for n in compact.body if not (isinstance(n, ast.Assert) and "SCAN_WIDTH" in ast.unparse(n))]
