@@ -149,7 +149,7 @@ def decode_compact(P: int, SCAN_WIDTH: int = 128, STAGE_INPUT: bool = False):
 
 
 @tilelang.jit(target="ascend", out_idx=[])
-def decode_finish(STABLE_TIE: bool = False, ADAPTIVE_TIE: bool = False, EARLY_EXIT: bool = False, FUSE_QUOTA: bool = False):
+def decode_finish(STABLE_TIE: bool = False, ADAPTIVE_TIE: bool = False, EARLY_EXIT: bool = False, FUSE_QUOTA: bool = False, SKIP_INDEX_PREFIX: bool = False):
     assert not (STABLE_TIE and ADAPTIVE_TIE)
     def score_key(value):
         bits = T.reinterpret(value, T.uint32)
@@ -202,123 +202,125 @@ def decode_finish(STABLE_TIE: bool = False, ADAPTIVE_TIE: bool = False, EARLY_EX
                 T.if_then_else(meta[2] <= 2048, 8, 4)
                 if ADAPTIVE_TIE else (4 if STABLE_TIE else 8)
             ):
-                if (not EARLY_EXIT) or state[0] > 0:
-                    with T.SimtVF(threads=128):
-                        for bucket in T.Parallel(256):
-                            hist[bucket] = 0
-                        for thread in T.Parallel(128):
-                            if thread == 0:
-                                state[2] = -1
-                                state[3] = 0
-                    with T.SimtVF(threads=128):
-                        count = T.alloc_var(T.int32)
-                        count = T.if_then_else(meta[2] <= 2048, meta[2], 16384)
-                        for tile in T.serial(T.ceildiv(count, 128)):
-                            for lane in T.Parallel(128):
-                                j = tile * 128 + lane
-                                if state[0] > 0 and j < count:
-                                    value_key = T.alloc_var(T.uint32)
-                                    absolute = T.alloc_var(T.int32)
-                                    valid = T.alloc_var(T.int32)
-                                    valid = 1
-                                    if meta[2] <= 2048:
-                                        value_key = keys[T.max(0, T.min(j, 2047))]
-                                        absolute = indices[T.max(0, T.min(j, 2047))]
-                                    else:
-                                        absolute = j
-                                        valid = 0
-                                        if j >= starts[0] and j < ends[0]:
-                                            if coarse_byte(x[j]) == meta[0]:
-                                                value_key = score_key(x[j])
-                                                valid = 1
-                                    if valid > 0:
-                                        index_key = ~T.Cast(T.uint32, absolute)
-                                        if (value_key & prefix[1]) == prefix[0] and (True if STABLE_TIE else (index_key & prefix[3]) == prefix[2]):
-                                            key = value_key if STABLE_TIE else T.if_then_else(round < 4, value_key, index_key)
-                                            shift = 24 - round * 8 if STABLE_TIE else 24 - (round % 4) * 8
-                                            digit = T.alloc_var(T.int32)
-                                            digit = T.Cast(T.int32, (key >> shift) & T.Cast(T.uint32, 255))
-                                            T.atomic_add(hist[T.max(0, T.min(digit, 255))], 1)
-                    with T.SimtVF(threads=128):
-                        for group in T.Parallel(16):
-                            total = T.alloc_var(T.int32)
-                            total = 0
-                            for j in T.serial(16):
-                                bucket = 255 - group * 16 - j
-                                local_prefix[bucket] = total
-                                total = total + hist[bucket]
-                            groups[group] = total
-                    with T.SimtVF(threads=128):
-                        for thread in T.Parallel(128):
-                            if thread == 0:
+                # Absolute indices are in [0, 16384); complemented high 16 bits are constant.
+                if (not SKIP_INDEX_PREFIX) or round < 4 or round >= 6:
+                    if (not EARLY_EXIT) or state[0] > 0:
+                        with T.SimtVF(threads=128):
+                            for bucket in T.Parallel(256):
+                                hist[bucket] = 0
+                            for thread in T.Parallel(128):
+                                if thread == 0:
+                                    state[2] = -1
+                                    state[3] = 0
+                        with T.SimtVF(threads=128):
+                            count = T.alloc_var(T.int32)
+                            count = T.if_then_else(meta[2] <= 2048, meta[2], 16384)
+                            for tile in T.serial(T.ceildiv(count, 128)):
+                                for lane in T.Parallel(128):
+                                    j = tile * 128 + lane
+                                    if state[0] > 0 and j < count:
+                                        value_key = T.alloc_var(T.uint32)
+                                        absolute = T.alloc_var(T.int32)
+                                        valid = T.alloc_var(T.int32)
+                                        valid = 1
+                                        if meta[2] <= 2048:
+                                            value_key = keys[T.max(0, T.min(j, 2047))]
+                                            absolute = indices[T.max(0, T.min(j, 2047))]
+                                        else:
+                                            absolute = j
+                                            valid = 0
+                                            if j >= starts[0] and j < ends[0]:
+                                                if coarse_byte(x[j]) == meta[0]:
+                                                    value_key = score_key(x[j])
+                                                    valid = 1
+                                        if valid > 0:
+                                            index_key = ~T.Cast(T.uint32, absolute)
+                                            if (value_key & prefix[1]) == prefix[0] and (True if STABLE_TIE else (index_key & prefix[3]) == prefix[2]):
+                                                key = value_key if STABLE_TIE else T.if_then_else(round < 4, value_key, index_key)
+                                                shift = 24 - round * 8 if STABLE_TIE else 24 - (round % 4) * 8
+                                                digit = T.alloc_var(T.int32)
+                                                digit = T.Cast(T.int32, (key >> shift) & T.Cast(T.uint32, 255))
+                                                T.atomic_add(hist[T.max(0, T.min(digit, 255))], 1)
+                        with T.SimtVF(threads=128):
+                            for group in T.Parallel(16):
                                 total = T.alloc_var(T.int32)
-                                count = T.alloc_var(T.int32)
                                 total = 0
-                                for group in T.serial(16):
-                                    count = groups[group]
-                                    groups[group] = total
-                                    total = total + count
-                                state[3] = total
-                    with T.SimtVF(threads=128):
-                        for bucket in T.Parallel(256):
-                            before = T.alloc_var(T.int32)
-                            through = T.alloc_var(T.int32)
-                            before = local_prefix[bucket] + groups[(255 - bucket) // 16]
-                            through = before + hist[bucket]
-                            hist[bucket] = before
-                            if before <= state[0] and through > state[0]:
-                                state[2] = bucket
-                                state[3] = before
-                    if not FUSE_QUOTA:
+                                for j in T.serial(16):
+                                    bucket = 255 - group * 16 - j
+                                    local_prefix[bucket] = total
+                                    total = total + hist[bucket]
+                                groups[group] = total
                         with T.SimtVF(threads=128):
                             for thread in T.Parallel(128):
                                 if thread == 0:
-                                    state[0] = state[0] - state[3]
-                    with T.SimtVF(threads=128):
-                        count = T.alloc_var(T.int32)
-                        count = T.if_then_else(meta[2] <= 2048, meta[2], 16384)
-                        for tile in T.serial(T.ceildiv(count, 128)):
-                            for lane in T.Parallel(128):
-                                j = tile * 128 + lane
-                                if state[3] > 0 and j < count:
-                                    value_key = T.alloc_var(T.uint32)
-                                    absolute = T.alloc_var(T.int32)
-                                    valid = T.alloc_var(T.int32)
-                                    valid = 1
-                                    if meta[2] <= 2048:
-                                        value_key = keys[T.max(0, T.min(j, 2047))]
-                                        absolute = indices[T.max(0, T.min(j, 2047))]
-                                    else:
-                                        absolute = j
-                                        valid = 0
-                                        if j >= starts[0] and j < ends[0]:
-                                            if coarse_byte(x[j]) == meta[0]:
-                                                value_key = score_key(x[j])
-                                                valid = 1
-                                    if valid > 0:
-                                        index_key = ~T.Cast(T.uint32, absolute)
-                                        if (value_key & prefix[1]) == prefix[0] and (True if STABLE_TIE else (index_key & prefix[3]) == prefix[2]):
-                                            key = value_key if STABLE_TIE else T.if_then_else(round < 4, value_key, index_key)
-                                            shift = 24 - round * 8 if STABLE_TIE else 24 - (round % 4) * 8
-                                            digit = T.alloc_var(T.int32)
-                                            digit = T.Cast(T.int32, (key >> shift) & T.Cast(T.uint32, 255))
-                                            if digit > state[2]:
-                                                pos = T.atomic_add(hist[T.max(0, T.min(digit, 255))], 1, return_prev=True) + state[1]
-                                                if pos >= 0 and pos < 2048:
-                                                    out[pos] = absolute
-                    with T.SimtVF(threads=128):
-                        for thread in T.Parallel(128):
-                            if thread == 0:
-                                if FUSE_QUOTA:
-                                    state[0] = state[0] - state[3]
-                                state[1] = state[1] + state[3]
-                                if state[2] >= 0:
-                                    if round < 4:
-                                        prefix[0] = prefix[0] | (T.Cast(T.uint32, state[2]) << (24 - round * 8))
-                                        prefix[1] = prefix[1] | (T.Cast(T.uint32, 255) << (24 - round * 8))
-                                    else:
-                                        prefix[2] = prefix[2] | (T.Cast(T.uint32, state[2]) << (24 - (round - 4) * 8))
-                                        prefix[3] = prefix[3] | (T.Cast(T.uint32, 255) << (24 - (round - 4) * 8))
+                                    total = T.alloc_var(T.int32)
+                                    count = T.alloc_var(T.int32)
+                                    total = 0
+                                    for group in T.serial(16):
+                                        count = groups[group]
+                                        groups[group] = total
+                                        total = total + count
+                                    state[3] = total
+                        with T.SimtVF(threads=128):
+                            for bucket in T.Parallel(256):
+                                before = T.alloc_var(T.int32)
+                                through = T.alloc_var(T.int32)
+                                before = local_prefix[bucket] + groups[(255 - bucket) // 16]
+                                through = before + hist[bucket]
+                                hist[bucket] = before
+                                if before <= state[0] and through > state[0]:
+                                    state[2] = bucket
+                                    state[3] = before
+                        if not FUSE_QUOTA:
+                            with T.SimtVF(threads=128):
+                                for thread in T.Parallel(128):
+                                    if thread == 0:
+                                        state[0] = state[0] - state[3]
+                        with T.SimtVF(threads=128):
+                            count = T.alloc_var(T.int32)
+                            count = T.if_then_else(meta[2] <= 2048, meta[2], 16384)
+                            for tile in T.serial(T.ceildiv(count, 128)):
+                                for lane in T.Parallel(128):
+                                    j = tile * 128 + lane
+                                    if state[3] > 0 and j < count:
+                                        value_key = T.alloc_var(T.uint32)
+                                        absolute = T.alloc_var(T.int32)
+                                        valid = T.alloc_var(T.int32)
+                                        valid = 1
+                                        if meta[2] <= 2048:
+                                            value_key = keys[T.max(0, T.min(j, 2047))]
+                                            absolute = indices[T.max(0, T.min(j, 2047))]
+                                        else:
+                                            absolute = j
+                                            valid = 0
+                                            if j >= starts[0] and j < ends[0]:
+                                                if coarse_byte(x[j]) == meta[0]:
+                                                    value_key = score_key(x[j])
+                                                    valid = 1
+                                        if valid > 0:
+                                            index_key = ~T.Cast(T.uint32, absolute)
+                                            if (value_key & prefix[1]) == prefix[0] and (True if STABLE_TIE else (index_key & prefix[3]) == prefix[2]):
+                                                key = value_key if STABLE_TIE else T.if_then_else(round < 4, value_key, index_key)
+                                                shift = 24 - round * 8 if STABLE_TIE else 24 - (round % 4) * 8
+                                                digit = T.alloc_var(T.int32)
+                                                digit = T.Cast(T.int32, (key >> shift) & T.Cast(T.uint32, 255))
+                                                if digit > state[2]:
+                                                    pos = T.atomic_add(hist[T.max(0, T.min(digit, 255))], 1, return_prev=True) + state[1]
+                                                    if pos >= 0 and pos < 2048:
+                                                        out[pos] = absolute
+                        with T.SimtVF(threads=128):
+                            for thread in T.Parallel(128):
+                                if thread == 0:
+                                    if FUSE_QUOTA:
+                                        state[0] = state[0] - state[3]
+                                    state[1] = state[1] + state[3]
+                                    if state[2] >= 0:
+                                        if round < 4:
+                                            prefix[0] = prefix[0] | (T.Cast(T.uint32, state[2]) << (24 - round * 8))
+                                            prefix[1] = prefix[1] | (T.Cast(T.uint32, 255) << (24 - round * 8))
+                                        else:
+                                            prefix[2] = prefix[2] | (T.Cast(T.uint32, state[2]) << (24 - (round - 4) * 8))
+                                            prefix[3] = prefix[3] | (T.Cast(T.uint32, 255) << (24 - (round - 4) * 8))
             if STABLE_TIE or ADAPTIVE_TIE:
                 if (not ADAPTIVE_TIE) or meta[2] > 2048:
                     # Absolute-index segments avoid depending on compact's slot order.
