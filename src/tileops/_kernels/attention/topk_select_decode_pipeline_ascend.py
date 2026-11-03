@@ -149,7 +149,7 @@ def decode_compact(P: int, SCAN_WIDTH: int = 128, STAGE_INPUT: bool = False):
 
 
 @tilelang.jit(target="ascend", out_idx=[])
-def decode_finish(STABLE_TIE: bool = False, ADAPTIVE_TIE: bool = False, EARLY_EXIT: bool = False):
+def decode_finish(STABLE_TIE: bool = False, ADAPTIVE_TIE: bool = False, EARLY_EXIT: bool = False, FUSE_QUOTA: bool = False):
     assert not (STABLE_TIE and ADAPTIVE_TIE)
     def score_key(value):
         bits = T.reinterpret(value, T.uint32)
@@ -269,10 +269,11 @@ def decode_finish(STABLE_TIE: bool = False, ADAPTIVE_TIE: bool = False, EARLY_EX
                             if before <= state[0] and through > state[0]:
                                 state[2] = bucket
                                 state[3] = before
-                    with T.SimtVF(threads=128):
-                        for thread in T.Parallel(128):
-                            if thread == 0:
-                                state[0] = state[0] - state[3]
+                    if not FUSE_QUOTA:
+                        with T.SimtVF(threads=128):
+                            for thread in T.Parallel(128):
+                                if thread == 0:
+                                    state[0] = state[0] - state[3]
                     with T.SimtVF(threads=128):
                         count = T.alloc_var(T.int32)
                         count = T.if_then_else(meta[2] <= 2048, meta[2], 16384)
@@ -308,6 +309,8 @@ def decode_finish(STABLE_TIE: bool = False, ADAPTIVE_TIE: bool = False, EARLY_EX
                     with T.SimtVF(threads=128):
                         for thread in T.Parallel(128):
                             if thread == 0:
+                                if FUSE_QUOTA:
+                                    state[0] = state[0] - state[3]
                                 state[1] = state[1] + state[3]
                                 if state[2] >= 0:
                                     if round < 4:

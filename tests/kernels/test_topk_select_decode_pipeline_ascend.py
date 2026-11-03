@@ -64,13 +64,13 @@ def coarse(value):
     return key >> 8
 
 
-def run(values, start, end, p, reverse=False, stable=False, adaptive=False, grouped=False, early=False, scan_width=128, stage_input=False):
+def run(values, start, end, p, reverse=False, stable=False, adaptive=False, grouped=False, early=False, scan_width=128, stage_input=False, fuse_quota=False):
     def add(array, i, value):
         old = array[i]
         array[i] += value
         return old
 
-    base = dict(STAGE_INPUT=stage_input, SCAN_WIDTH={128: 8, 512: 32}[scan_width], EARLY_EXIT=early, GROUPED_OFFSETS=grouped, STABLE_TIE=stable, ADAPTIVE_TIE=adaptive, x=values, starts=[start], ends=[end], P=p, K=16,
+    base = dict(FUSE_QUOTA=fuse_quota, STAGE_INPUT=stage_input, SCAN_WIDTH={128: 8, 512: 32}[scan_width], EARLY_EXIT=early, GROUPED_OFFSETS=grouped, STABLE_TIE=stable, ADAPTIVE_TIE=adaptive, x=values, starts=[start], ends=[end], P=p, K=16,
                 meta=[-1] * 4, higher=[-1] * 256, out=[-1] * 16,
                 offsets=Matrix([[0, 0] for _ in range(p)]), candidate_scores=[0.] * 16,
                 candidate_indices=[0] * 16, final_state=[-1, -1],
@@ -166,6 +166,27 @@ class DecodePipelineTest(unittest.TestCase):
                             self.assertEqual(sorted(new["out"]), sorted(old["out"]))
                             self.assertEqual(new["final_state"], old["final_state"])
 
+    def test_fused_quota_preserves_sets_and_removes_vf(self):
+        rng = random.Random(27)
+        cases = [[rng.uniform(-1, 1) for _ in range(256)], [1.] * 256,
+                 [float("nan"), float("inf"), -float("inf"), 0., -0.] * 51 + [1.],
+                 [1000.] * 15 + [100.] * 16 + [0.] * 225,
+                 [1000.] * 15 + [100.] * 17 + [0.] * 224]
+        reduced = False
+        for values in cases:
+            for start, end in [(0, 256), (9, 210), (11, 20), (20, 20), (30, 20)]:
+                for reverse in [False, True]:
+                    for stable, adaptive in [(False, False), (True, False), (False, True)]:
+                        for early in [False, True]:
+                            old, expected = run(values, start, end, 4, reverse, stable, adaptive, True, early, stage_input=True)
+                            new, _ = run(values, start, end, 4, reverse, stable, adaptive, True, early, stage_input=True, fuse_quota=True)
+                            self.assertEqual(sorted(new["out"]), sorted(expected))
+                            self.assertEqual(sorted(new["out"]), sorted(old["out"]))
+                            self.assertEqual(new["final_state"], old["final_state"])
+                            self.assertLessEqual(new["vf_calls"][0], old["vf_calls"][0])
+                            reduced |= new["vf_calls"][0] < old["vf_calls"][0]
+        self.assertTrue(reduced)
+
     def test_prepare_offsets_against_full_scale_oracle(self):
         prepare = next(n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == "decode_prepare")
         main = next(n for n in prepare.body if isinstance(n, ast.FunctionDef) and n.name == "main")
@@ -188,15 +209,25 @@ class DecodePipelineTest(unittest.TestCase):
 
     def test_disabled_finish_matches_measured_r1_ast(self):
         class Disable(ast.NodeTransformer):
+            def branch(self, nodes):
+                result = []
+                for node in nodes:
+                    value = self.visit(node)
+                    if value is not None:
+                        result.extend(value if isinstance(value, list) else [value])
+                return result
+
             def visit_Assert(self, node):
                 if "ADAPTIVE_TIE" in ast.unparse(node):
                     return None
                 return node
             def visit_If(self, node):
-                if ast.unparse(node.test) in {"STABLE_TIE or ADAPTIVE_TIE", "GROUPED_OFFSETS", "STAGE_INPUT"}:
-                    return [self.visit(n) for n in node.orelse]
+                if ast.unparse(node.test) in {"STABLE_TIE or ADAPTIVE_TIE", "GROUPED_OFFSETS", "STAGE_INPUT", "FUSE_QUOTA"}:
+                    return self.branch(node.orelse)
+                if ast.unparse(node.test) == "not FUSE_QUOTA":
+                    return self.branch(node.body)
                 if ast.unparse(node.test) == "not EARLY_EXIT or state[0] > 0":
-                    return [self.visit(n) for n in node.body]
+                    return self.branch(node.body)
                 return self.generic_visit(node)
 
             def visit_IfExp(self, node):
