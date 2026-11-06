@@ -6,6 +6,7 @@ import tileops.backend
 from tileops.kernels.attention.topk_select import TopKSelectCall, TopKSelectFwdInterface
 from tileops.kernels.kernel_base import Entry, Kernel
 
+from .hierarchical_select import pack_candidates, pack_shards, remap_candidates
 from .radix_select import topk_select_ascend
 from .simd_select import simd_workspace_bytes, topk_select_simd
 
@@ -15,7 +16,7 @@ class AscendTopKSelectKernel(Kernel, TopKSelectFwdInterface):
 
     devices = frozenset({"npu"})
     # Keep the measured general implementation until the SIMD candidate is validated.
-    preferred_over = frozenset({"ascend_simd"})
+    preferred_over = frozenset({"ascend_simd", "ascend_hierarchical"})
 
     @classmethod
     def refusal(cls, call: TopKSelectCall):
@@ -106,5 +107,85 @@ class AscendTopKSelectSIMDKernel(Kernel, TopKSelectFwdInterface):
         return output
 
 
+class AscendTopKSelectHierarchicalKernel(Kernel, TopKSelectFwdInterface):
+    """Experimental exact local-select/candidate-select route for few long rows."""
+
+    devices = frozenset({"npu"})
+
+    @classmethod
+    def refusal(cls, call: TopKSelectCall):
+        if call.dtype != torch.float32 or call.out_dtype != torch.int32:
+            return "requires float32 scores and int32 output"
+        return cls.plan_refusal(call, 2)
+
+    @staticmethod
+    def plan_refusal(call, shards):
+        if shards not in (2, 4, 8, 16, 28):
+            return "unsupported shard count"
+        n, k = call.seq_len_kv, call.topk
+        if not 0 < k <= n:
+            return "requires 0 < K <= N"
+        length = ((n + shards * 64 - 1) // (shards * 64)) * 64
+        local_k = min(k, length)
+        candidates = shards * local_k
+        if max(length, candidates) >= 65536:
+            return "resident local/candidate selector requires length < 65536"
+        if max(simd_workspace_bytes(length, local_k, 1),
+               simd_workspace_bytes(candidates, k, 1)) > 96 * 1024:
+            return "local/candidate selector exceeds 96 KiB workspace budget"
+        return None
+
+    @classmethod
+    def entry_for(cls, call: TopKSelectCall) -> Entry:
+        return call, lambda: cls(call)
+
+    def __init__(self, call: TopKSelectCall, shards=2):
+        reason = self.plan_refusal(call, shards)
+        if call.dtype != torch.float32 or call.out_dtype != torch.int32:
+            reason = "requires float32 scores and int32 output"
+        if reason is not None:
+            raise ValueError(reason)
+        super().__init__()
+        self.call, self.shards = call, shards
+        self.rows = call.batch * call.seq_len * call.kv_group
+        self.length = ((call.seq_len_kv + shards * 64 - 1) // (shards * 64)) * 64
+        self.local_k = min(call.topk, self.length)
+        self.candidates = shards * self.local_k
+        if self.rows:
+            r, n, g, p, l, j = (self.rows, call.seq_len_kv, call.kv_group,
+                                shards, self.length, self.local_k)
+            w = min(r * p, 28)
+            self.pack = pack_shards(r, n, g, p, l, w)
+            self.local = topk_select_simd(r * p, l, j, 1, w)
+            self.collect = pack_candidates(r, n, g, p, l, j, w)
+            self.finish = topk_select_simd(r, self.candidates, call.topk, 1, min(r, 28))
+            self.remap = remap_candidates(r, n, call.topk, self.candidates, min(r, 28))
+
+    def forward(self, index_score, starts, ends):
+        c, r, p, l, j = self.call, self.rows, self.shards, self.length, self.local_k
+        options = dict(dtype=torch.int32, device=index_score.device)
+        output = torch.empty((c.batch, c.seq_len, c.kv_group, c.topk), **options)
+        if not r:
+            return output
+        packed = torch.empty((r * p, l), **options)
+        lo, hi = torch.empty((r * p,), **options), torch.empty((r * p,), **options)
+        local_ids = torch.empty((r * p, j), **options)
+        scores = torch.empty((r, self.candidates), **options)
+        mapping = torch.empty_like(scores)
+        begin, end = torch.empty((r,), **options), torch.empty((r,), **options)
+        final_ids = torch.empty((r, c.topk), **options)
+        ramp = torch.arange(64, **options).view(torch.uint32)
+        bits = index_score.view(torch.uint32).reshape(c.batch * c.seq_len, c.seq_len_kv * c.kv_group)
+        self.pack(bits, starts.reshape(-1), ends.reshape(-1), packed.view(torch.uint32), lo, hi)
+        self.local(packed.view(torch.uint32), lo, hi, ramp, local_ids.view(torch.uint32))
+        self.collect(bits, lo, hi, local_ids.view(torch.uint32), scores.view(torch.uint32),
+                     mapping.view(torch.uint32), begin, end)
+        self.finish(scores.view(torch.uint32), begin, end, ramp, final_ids.view(torch.uint32))
+        self.remap(final_ids.view(torch.uint32), mapping.view(torch.uint32),
+                   output.view(torch.uint32).reshape(r, c.topk))
+        return output
+
+
 tileops.backend.register_kernel_type("TopKSelectFwdOp", "ascend", AscendTopKSelectKernel)
 tileops.backend.register_kernel_type("TopKSelectFwdOp", "ascend_simd", AscendTopKSelectSIMDKernel)
+tileops.backend.register_kernel_type("TopKSelectFwdOp", "ascend_hierarchical", AscendTopKSelectHierarchicalKernel)
