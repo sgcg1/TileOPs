@@ -19,15 +19,17 @@ def pack_shards(R: int, N: int, G: int, P: int, L: int, W: int):
                     row = task // P
                     base = (task % P) * L
                     count = T.max(0, T.min(L, N - base))
-                    for j in T.Parallel(L):
-                        data[j] = T.uint32(0)
+                    with T.SimtVF(threads=128):
+                        for j in T.Parallel(L):
+                            data[j] = T.uint32(0)
                     if G == 1:
                         if count > 0:
                             T.copy(x[row, base:base + count], data[:count])
                     else:
-                        for j in T.Parallel(L):
-                            if j < count:
-                                data[j] = x[row // G, (base + j) * G + row % G]
+                        with T.SimtVF(threads=128):
+                            for j in T.Parallel(L):
+                                if j < count:
+                                    data[j] = x[row // G, (base + j) * G + row % G]
                     T.copy(data, packed[task, :])
                     lo[task] = T.min(count, T.max(0, starts[row // G] - base))
                     hi[task] = T.min(count, T.max(0, ends[row // G] - base))
@@ -57,11 +59,12 @@ def pack_candidates(R: int, N: int, G: int, P: int, L: int, J: int, W: int):
                             offset += T.min(J, hi[row * P + earlier] - lo[row * P + earlier])
                     count = T.min(J, hi[task] - lo[task])
                     T.copy(ids[task, :], selected)
-                    for j in T.Parallel(J):
-                        if j < count:
-                            original = shard * L + T.cast(selected[j], "int32")
-                            scores[row, offset + j] = x[row // G, original * G + row % G]
-                            mapping[row, offset + j] = T.cast(original, "uint32")
+                    with T.SimtVF(threads=128):
+                        for j in T.Parallel(J):
+                            if j < count:
+                                original = shard * L + T.cast(selected[j], "int32")
+                                scores[row, offset + j] = x[row // G, original * G + row % G]
+                                mapping[row, offset + j] = T.cast(original, "uint32")
                     if shard == P - 1:
                         begin[row] = 0
                         end[row] = offset + count
@@ -77,10 +80,11 @@ def remap_candidates(R: int, N: int, K: int, C: int, W: int):
             for step in T.serial(T.ceildiv(R, W)):
                 row = worker + step * W
                 if row < R:
-                    for j in T.Parallel(K):
-                        index = ids[row, j]
-                        if index < C:
-                            out[row, j] = mapping[row, index]
-                        else:
-                            out[row, j] = T.cast(N, "uint32")
+                    with T.SimtVF(threads=128):
+                        for j in T.Parallel(K):
+                            index = ids[row, j]
+                            if index < C:
+                                out[row, j] = mapping[row, index]
+                            else:
+                                out[row, j] = T.cast(N, "uint32")
     return main
