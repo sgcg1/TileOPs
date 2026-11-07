@@ -1,5 +1,6 @@
 """Shape-parameterized resident SIMD radix selection; experimental dispatch candidate."""
 import tilelang
+from tvm import tirx
 import tilelang.ascend.language as T
 import tilelang.ascend.language.simd
 
@@ -11,7 +12,8 @@ def simd_workspace_bytes(n, k, groups):
 
 
 @tilelang.jit(target="ascend", out_idx=[])
-def topk_select_simd(R: int, N: int, K: int, G: int, W: int, COMPRESS: bool = False):
+def topk_select_simd(R: int, N: int, K: int, G: int, W: int, COMPRESS: bool = False, VF_TILES: int = 1):
+    assert VF_TILES in (1, 4, 8, 16)
     assert 0 < K <= N < 65536 and G > 0 and 0 < W <= R
     assert simd_workspace_bytes(N, K, G) <= 96 * 1024
     NP = (N + 63) // 64 * 64
@@ -127,7 +129,52 @@ def topk_select_simd(R: int, N: int, K: int, G: int, W: int, COMPRESS: bool = Fa
                                         selected_bin = 255 - bucket
                             prefix = prefix | (T.cast(selected_bin, "uint32") << (24 - round * 8))
                             prefix_mask = prefix_mask | (T.uint32(255) << (24 - round * 8))
-                        if COMPRESS:
+                        if COMPRESS and VF_TILES > 1:
+                            for group in T.serial(T.ceildiv(NP // 64, VF_TILES)):
+                                with T.SimdVF():
+                                    m = T.simd.pset(32)
+                                    one_lane = T.simd.pset(32, "PAT_VL1")
+                                    one = T.simd.vdup(T.uint32(1), "uint32", m)
+                                    zero = T.simd.vdup(T.uint32(0), "uint32", m)
+                                    lane_ids = T.simd.vld(lanes[0])
+                                    gt_offset = T.simd.alloc_var("uint32")
+                                    eq_offset = T.simd.alloc_var("uint32")
+                                    gt_offset = T.simd.vdup(T.cast(above_offset, "uint32"), "uint32", m)
+                                    eq_offset = T.simd.vdup(T.cast(equal_offset, "uint32"), "uint32", m)
+                                    quota_total = T.simd.vdup(T.cast(remaining, "uint32"), "uint32", m)
+                                    eq_base = T.simd.vdup(T.cast(K - remaining, "uint32"), "uint32", m)
+                                    for inner in T.serial(VF_TILES):
+                                        tile = group * VF_TILES + inner
+                                        if tile < NP // 64:
+                                            k = T.simd.vld(keys[tile * 64])
+                                            ids = T.simd.vadd(lane_ids, T.simd.vdup(T.cast(tile * 64, "uint32"), "uint32", m), m)
+                                            visible = T.simd.vcmps(ids, T.cast(begin, "uint32"), m, op="ge")
+                                            visible = T.simd.pand(visible, T.simd.vcmps(ids, T.cast(end, "uint32"), m, op="lt"), m)
+                                            gt = T.simd.pand(visible, T.simd.vcmps(k, prefix, m, op="gt"), m)
+                                            eq = T.simd.pand(visible, T.simd.vcmps(k, prefix, m, op="eq"), m)
+                                            rank = T.simd.vusqz(eq, "int32")
+                                            rank_unsigned = tirx.reinterpret("uint32x64", rank)
+                                            quota = T.simd.vsub(quota_total, eq_offset, m)
+                                            eq = T.simd.pand(eq, T.simd.vcmp(rank_unsigned, quota, m, op="lt"), m)
+                                            g = T.simd.vsqz(ids, gt)
+                                            e = T.simd.vsqz(ids, eq)
+                                            gc = T.simd.vdupv(T.simd.vcadd(T.simd.vsel(one, zero, gt), m), m)
+                                            ec = T.simd.vdupv(T.simd.vcadd(T.simd.vsel(one, zero, eq), m), m)
+                                            gmask = T.simd.vcmp(lane_ids, gc, m, op="lt")
+                                            emask = T.simd.vcmp(lane_ids, ec, m, op="lt")
+                                            gpos = T.simd.vadd(lane_ids, gt_offset, m)
+                                            epos = T.simd.vadd(lane_ids, T.simd.vadd(eq_base, eq_offset, m), m)
+                                            gpos = T.simd.vsel(gpos, zero, gmask)
+                                            epos = T.simd.vsel(epos, zero, emask)
+                                            T.simd.vscatter(g, T.access_ptr(result[0], "w", extent=K), gpos, gmask)
+                                            T.simd.vscatter(e, T.access_ptr(result[0], "w", extent=K), epos, emask)
+                                            gt_offset = T.simd.vadd(gt_offset, gc, m)
+                                            eq_offset = T.simd.vadd(eq_offset, ec, m)
+                                    T.simd.vsts(counts[0], gt_offset, one_lane, dist="ONEPT_B32", extent=1)
+                                    T.simd.vsts(counts[1], eq_offset, one_lane, dist="ONEPT_B32", extent=1)
+                                above_offset = T.cast(counts[0], "int32")
+                                equal_offset = T.cast(counts[1], "int32")
+                        elif COMPRESS:
                             for tile in T.serial(NP // 64):
                                 with T.SimdVF():
                                     m = T.simd.pset(32)

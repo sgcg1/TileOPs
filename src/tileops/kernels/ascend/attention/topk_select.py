@@ -61,6 +61,7 @@ class AscendTopKSelectSIMDKernel(Kernel, TopKSelectFwdInterface):
 
     devices = frozenset({"npu"})
     compress_output = False
+    output_tiles_per_vf = 1
 
     @classmethod
     def refusal(cls, call: TopKSelectCall):
@@ -86,7 +87,7 @@ class AscendTopKSelectSIMDKernel(Kernel, TopKSelectFwdInterface):
         self.program = (
             topk_select_simd(
                 self.rows, call.seq_len_kv, call.topk, call.kv_group, min(self.rows, 28),
-                self.compress_output,
+                self.compress_output, self.output_tiles_per_vf,
             ) if self.rows else None
         )
 
@@ -113,6 +114,16 @@ class AscendTopKSelectCompactKernel(AscendTopKSelectSIMDKernel):
     """Same exact threshold selector with mask compression instead of double scan."""
 
     compress_output = True
+
+
+class AscendTopKSelectGroupedCompactKernel(AscendTopKSelectCompactKernel):
+    """Explicit experimental VF batch size; no automatic dispatch promotion."""
+
+    def __init__(self, call: TopKSelectCall, tiles_per_vf=4):
+        if tiles_per_vf not in (4, 8, 16):
+            raise ValueError("tiles_per_vf must be 4, 8 or 16")
+        self.output_tiles_per_vf = tiles_per_vf
+        super().__init__(call)
 
 
 class AscendTopKSelectHierarchicalKernel(Kernel, TopKSelectFwdInterface):
