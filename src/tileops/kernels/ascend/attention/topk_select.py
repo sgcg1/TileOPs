@@ -128,6 +128,16 @@ class AscendTopKSelectGroupedCompactKernel(AscendTopKSelectCompactKernel):
         super().__init__(call)
 
 
+class AscendTopKSelectResidentKernel(AscendTopKSelectCompactKernel):
+    """Resource-bounded resident selector with grouped output and bucket exit."""
+
+    output_tiles_per_vf = 16
+    early_bucket = True
+    preferred_over = frozenset({
+        "ascend", "ascend_simd", "ascend_simd_compact", "ascend_hierarchical",
+    })
+
+
 class AscendTopKSelectHierarchicalKernel(Kernel, TopKSelectFwdInterface):
     """Experimental exact local-select/candidate-select route for few long rows."""
 
@@ -212,3 +222,4 @@ tileops.backend.register_kernel_type("TopKSelectFwdOp", "ascend_simd", AscendTop
 tileops.backend.register_kernel_type("TopKSelectFwdOp", "ascend_hierarchical", AscendTopKSelectHierarchicalKernel)
 
 tileops.backend.register_kernel_type("TopKSelectFwdOp", "ascend_simd_compact", AscendTopKSelectCompactKernel)
+tileops.backend.register_kernel_type("TopKSelectFwdOp", "ascend_resident", AscendTopKSelectResidentKernel)
