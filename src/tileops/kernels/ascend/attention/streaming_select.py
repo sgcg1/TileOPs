@@ -11,11 +11,13 @@ def streaming_workspace_bytes(k, groups, block=0):
 
 
 @tilelang.jit(target="ascend", out_idx=[])
-def topk_select_streaming(R: int, N: int, K: int, G: int, W: int, BLOCK: int = 0, FUSE_KEYS: bool = False):
+def topk_select_streaming(R: int, N: int, K: int, G: int, W: int, BLOCK: int = 0, FUSE_KEYS: bool = False, COMPACT: bool = False):
     assert 0 < K <= N < 2147483647 and G > 0 and 0 < W <= R
     NP = BLOCK or (8192 if G == 1 else 2048)
     assert NP in (2048, 8192, 16384)
     assert streaming_workspace_bytes(K, G, NP) <= 96 * 1024
+    CAP = 4096
+    assert not COMPACT or (FUSE_KEYS and G == 1 and streaming_workspace_bytes(K, G, NP) + CAP * 4 <= 96 * 1024)
     KP = (K + 63) // 64 * 64
     VF_TILES = 16
 
@@ -33,6 +35,9 @@ def topk_select_streaming(R: int, N: int, K: int, G: int, W: int, BLOCK: int = 0
                     lanes = T.alloc_shared((64,), "uint32")
                     hist = T.alloc_shared((2, 128), "uint16")
                     sums = T.alloc_shared((256,), "uint32")
+                    candidates = T.alloc_shared((CAP if COMPACT else 1,), "uint32")
+                    candidate_count = T.alloc_var("int32", init=0)
+                    collected = T.alloc_var("int32", init=0)
                     counts = T.alloc_shared((64,), "uint32")
                     prefix = T.alloc_var("uint32", init=0)
                     prefix_mask = T.alloc_var("uint32", init=0)
@@ -60,40 +65,41 @@ def topk_select_streaming(R: int, N: int, K: int, G: int, W: int, BLOCK: int = 0
                                 m = T.simd.pset(32)
                                 for part in T.serial(4):
                                     T.simd.vsts(sums[part * 64], T.simd.vdup(T.uint32(0), "uint32", m), m)
-                            for chunk in T.serial(T.ceildiv(N, NP)):
-                                with T.SimdVF():
-                                    m = T.simd.pset(32)
-                                    for tile in T.serial(NP // 64):
-                                        T.simd.vsts(keys[tile * 64], T.simd.vdup(T.uint32(0), "uint32", m), m)
-                                if G == 1:
-                                    T.copy(bits[row, chunk * NP:chunk * NP + T.min(NP, N - chunk * NP)], keys[:T.min(NP, N - chunk * NP)])
-                                else:
-                                    with T.SimdVF():
-                                        m = T.simd.pset(32)
-                                        for tile in T.serial(NP * G // 64):
-                                            T.simd.vsts(packed[tile * 64], T.simd.vdup(T.uint32(0), "uint32", m), m)
-                                    T.copy(bits[row // G, chunk * NP * G:(chunk * NP + T.min(NP, N - chunk * NP)) * G], packed[:T.min(NP, N - chunk * NP) * G])
-                                    with T.SimdVF():
-                                        m = T.simd.pset(32)
-                                        for tile in T.serial(NP // 64):
-                                            ids = T.simd.vadd(T.simd.vld(lanes[0]), T.simd.vdup(T.cast(tile * 64, "uint32"), "uint32", m), m)
-                                            offsets = T.simd.vadd(T.simd.vmul(ids, T.simd.vdup(T.uint32(G), "uint32", m), m), T.simd.vdup(T.cast(row % G, "uint32"), "uint32", m), m)
-                                            values = T.simd.vgather2(T.access_ptr(packed[0], "r", extent=NP * G), offsets, m)
-                                            T.simd.vsts(keys[tile * 64], values, m)
-                                if not FUSE_KEYS:
-                                    with T.SimdVF():
-                                        m = T.simd.pset(32)
-                                        sign = T.simd.vdup(T.uint32(0x80000000), "uint32", m)
-                                        magnitude_mask = T.simd.vdup(T.uint32(0x7fffffff), "uint32", m)
-                                        ones = T.simd.vdup(T.uint32(0xffffffff), "uint32", m)
-                                        for tile in T.serial(NP // 64):
-                                            b = T.simd.vld(keys[tile * 64])
-                                            magnitude = T.simd.vand(b, magnitude_mask, m)
-                                            neg = T.simd.vcmps(b, T.uint32(0x80000000), m, op="ge")
-                                            k = T.simd.vsel(T.simd.vxor(b, ones, m), T.simd.vxor(b, sign, m), neg)
-                                            k = T.simd.vsel(sign, k, T.simd.vcmps(magnitude, T.uint32(0), m, op="eq"))
-                                            k = T.simd.vsel(ones, k, T.simd.vcmps(magnitude, T.uint32(0x7f800000), m, op="gt"))
-                                            T.simd.vsts(keys[tile * 64], k, m)
+                            if COMPACT and candidate_count > 0 and candidate_count <= CAP:
+                                if round == 1:
+                                    for chunk in T.serial(T.ceildiv(N, NP)):
+                                        T.copy(bits[row, chunk * NP:chunk * NP + T.min(NP, N - chunk * NP)], keys[:T.min(NP, N - chunk * NP)])
+                                        with T.SimdVF():
+                                            m = T.simd.pset(32)
+                                            one_lane = T.simd.pset(32, "PAT_VL1")
+                                            sign = T.simd.vdup(T.uint32(0x80000000), "uint32", m)
+                                            magnitude_mask = T.simd.vdup(T.uint32(0x7fffffff), "uint32", m)
+                                            ones = T.simd.vdup(T.uint32(0xffffffff), "uint32", m)
+                                            one = T.simd.vdup(T.uint32(1), "uint32", m)
+                                            zero = T.simd.vdup(T.uint32(0), "uint32", m)
+                                            high = T.simd.vdup(T.uint32(0xff000000), "uint32", m)
+                                            lane = T.simd.vld(lanes[0])
+                                            offset = T.simd.alloc_var("uint32")
+                                            offset = T.simd.vdup(T.cast(collected, "uint32"), "uint32", m)
+                                            for tile in T.serial(T.ceildiv(T.min(NP, N - chunk * NP), 64)):
+                                                ids = T.simd.vadd(lane, T.simd.vdup(T.cast(chunk * NP + tile * 64, "uint32"), "uint32", m), m)
+                                                b = T.simd.vld(keys[tile * 64])
+                                                magnitude = T.simd.vand(b, magnitude_mask, m)
+                                                neg = T.simd.vcmps(b, T.uint32(0x80000000), m, op="ge")
+                                                k = T.simd.vsel(T.simd.vxor(b, ones, m), T.simd.vxor(b, sign, m), neg)
+                                                k = T.simd.vsel(sign, k, T.simd.vcmps(magnitude, T.uint32(0), m, op="eq"))
+                                                k = T.simd.vsel(ones, k, T.simd.vcmps(magnitude, T.uint32(0x7f800000), m, op="gt"))
+                                                visible = T.simd.pand(T.simd.vcmps(ids, T.cast(begin, "uint32"), m, op="ge"), T.simd.vcmps(ids, T.cast(end, "uint32"), m, op="lt"), m)
+                                                matched = T.simd.vcmps(T.simd.vand(k, high, m), prefix, m, op="eq")
+                                                keep = T.simd.pand(visible, matched, m)
+                                                values = T.simd.vsqz(k, keep)
+                                                count = T.simd.vdupv(T.simd.vcadd(T.simd.vsel(one, zero, keep), m), m)
+                                                valid = T.simd.vcmp(lane, count, m, op="lt")
+                                                positions = T.simd.vsel(T.simd.vadd(lane, offset, m), zero, valid)
+                                                T.simd.vscatter(values, T.access_ptr(candidates[0], "w", extent=CAP), positions, valid)
+                                                offset = T.simd.vadd(offset, count, m)
+                                            T.simd.vsts(counts[0], offset, one_lane, dist="ONEPT_B32", extent=1)
+                                        collected = T.cast(counts[0], "int32")
                                 with T.SimdVF():
                                     m32 = T.simd.pset(32)
                                     m16 = T.simd.pset(16)
@@ -107,21 +113,10 @@ def topk_select_streaming(R: int, N: int, K: int, G: int, W: int, BLOCK: int = 0
                                     zero8 = T.simd.vdup(T.uint8(0), "uint8", m8)
                                     byte_mask = T.simd.vdup(T.uint32(255), "uint32", m32)
                                     high_mask = T.simd.vdup(prefix_mask, "uint32", m32)
-                                    if FUSE_KEYS:
-                                        fused_sign = T.simd.vdup(T.uint32(0x80000000), "uint32", m32)
-                                        fused_magnitude_mask = T.simd.vdup(T.uint32(0x7fffffff), "uint32", m32)
-                                        fused_ones = T.simd.vdup(T.uint32(0xffffffff), "uint32", m32)
-                                    for tile in T.serial(NP // 64):
-                                        k = T.simd.vld(keys[tile * 64])
-                                        if FUSE_KEYS:
-                                            magnitude = T.simd.vand(k, fused_magnitude_mask, m32)
-                                            neg = T.simd.vcmps(k, T.uint32(0x80000000), m32, op="ge")
-                                            k = T.simd.vsel(T.simd.vxor(k, fused_ones, m32), T.simd.vxor(k, fused_sign, m32), neg)
-                                            k = T.simd.vsel(fused_sign, k, T.simd.vcmps(magnitude, T.uint32(0), m32, op="eq"))
-                                            k = T.simd.vsel(fused_ones, k, T.simd.vcmps(magnitude, T.uint32(0x7f800000), m32, op="gt"))
-                                        ids = T.simd.vadd(T.simd.vld(lanes[0]), T.simd.vdup(T.cast(chunk * NP + tile * 64, "uint32"), "uint32", m32), m32)
-                                        visible = T.simd.vcmps(ids, T.cast(begin, "uint32"), m32, op="ge")
-                                        visible = T.simd.pand(visible, T.simd.vcmps(ids, T.cast(end, "uint32"), m32, op="lt"), m32)
+                                    for tile in T.serial(T.ceildiv(candidate_count, 64)):
+                                        ids = T.simd.vadd(T.simd.vld(lanes[0]), T.simd.vdup(T.cast(tile * 64, "uint32"), "uint32", m32), m32)
+                                        visible = T.simd.vcmps(ids, T.cast(candidate_count, "uint32"), m32, op="lt")
+                                        k = T.simd.vld(candidates[tile * 64])
                                         matched = T.simd.vcmps(T.simd.vand(k, high_mask, m32), prefix, m32, op="eq")
                                         active32 = T.simd.pand(visible, matched, m32)
                                         digit32 = T.simd.vand(T.simd.vshrs(k, 24 - round * 8, m32), byte_mask, m32)
@@ -144,6 +139,91 @@ def topk_select_streaming(R: int, N: int, K: int, G: int, W: int, BLOCK: int = 0
                                         odd = T.simd.vcvt(v, "uint32", m16, part=1)
                                         T.simd.vsts(sums[bank * 128], T.simd.vadd(T.simd.vld(sums[bank * 128]), even, m32), m32)
                                         T.simd.vsts(sums[bank * 128 + 64], T.simd.vadd(T.simd.vld(sums[bank * 128 + 64]), odd, m32), m32)
+                            else:
+                                for chunk in T.serial(T.ceildiv(N, NP)):
+                                    with T.SimdVF():
+                                        m = T.simd.pset(32)
+                                        for tile in T.serial(NP // 64):
+                                            T.simd.vsts(keys[tile * 64], T.simd.vdup(T.uint32(0), "uint32", m), m)
+                                    if G == 1:
+                                        T.copy(bits[row, chunk * NP:chunk * NP + T.min(NP, N - chunk * NP)], keys[:T.min(NP, N - chunk * NP)])
+                                    else:
+                                        with T.SimdVF():
+                                            m = T.simd.pset(32)
+                                            for tile in T.serial(NP * G // 64):
+                                                T.simd.vsts(packed[tile * 64], T.simd.vdup(T.uint32(0), "uint32", m), m)
+                                        T.copy(bits[row // G, chunk * NP * G:(chunk * NP + T.min(NP, N - chunk * NP)) * G], packed[:T.min(NP, N - chunk * NP) * G])
+                                        with T.SimdVF():
+                                            m = T.simd.pset(32)
+                                            for tile in T.serial(NP // 64):
+                                                ids = T.simd.vadd(T.simd.vld(lanes[0]), T.simd.vdup(T.cast(tile * 64, "uint32"), "uint32", m), m)
+                                                offsets = T.simd.vadd(T.simd.vmul(ids, T.simd.vdup(T.uint32(G), "uint32", m), m), T.simd.vdup(T.cast(row % G, "uint32"), "uint32", m), m)
+                                                values = T.simd.vgather2(T.access_ptr(packed[0], "r", extent=NP * G), offsets, m)
+                                                T.simd.vsts(keys[tile * 64], values, m)
+                                    if not FUSE_KEYS:
+                                        with T.SimdVF():
+                                            m = T.simd.pset(32)
+                                            sign = T.simd.vdup(T.uint32(0x80000000), "uint32", m)
+                                            magnitude_mask = T.simd.vdup(T.uint32(0x7fffffff), "uint32", m)
+                                            ones = T.simd.vdup(T.uint32(0xffffffff), "uint32", m)
+                                            for tile in T.serial(NP // 64):
+                                                b = T.simd.vld(keys[tile * 64])
+                                                magnitude = T.simd.vand(b, magnitude_mask, m)
+                                                neg = T.simd.vcmps(b, T.uint32(0x80000000), m, op="ge")
+                                                k = T.simd.vsel(T.simd.vxor(b, ones, m), T.simd.vxor(b, sign, m), neg)
+                                                k = T.simd.vsel(sign, k, T.simd.vcmps(magnitude, T.uint32(0), m, op="eq"))
+                                                k = T.simd.vsel(ones, k, T.simd.vcmps(magnitude, T.uint32(0x7f800000), m, op="gt"))
+                                                T.simd.vsts(keys[tile * 64], k, m)
+                                    with T.SimdVF():
+                                        m32 = T.simd.pset(32)
+                                        m16 = T.simd.pset(16)
+                                        m8 = T.simd.pset(8)
+                                        f0 = T.simd.alloc_var("uint16")
+                                        f1 = T.simd.alloc_var("uint16")
+                                        f0 = T.simd.vdup(T.uint16(0), "uint16", m16)
+                                        f1 = T.simd.vdup(T.uint16(0), "uint16", m16)
+                                        ones32 = T.simd.vdup(T.uint32(1), "uint32", m32)
+                                        zero32 = T.simd.vdup(T.uint32(0), "uint32", m32)
+                                        zero8 = T.simd.vdup(T.uint8(0), "uint8", m8)
+                                        byte_mask = T.simd.vdup(T.uint32(255), "uint32", m32)
+                                        high_mask = T.simd.vdup(prefix_mask, "uint32", m32)
+                                        if FUSE_KEYS:
+                                            fused_sign = T.simd.vdup(T.uint32(0x80000000), "uint32", m32)
+                                            fused_magnitude_mask = T.simd.vdup(T.uint32(0x7fffffff), "uint32", m32)
+                                            fused_ones = T.simd.vdup(T.uint32(0xffffffff), "uint32", m32)
+                                        for tile in T.serial(NP // 64):
+                                            k = T.simd.vld(keys[tile * 64])
+                                            if FUSE_KEYS:
+                                                magnitude = T.simd.vand(k, fused_magnitude_mask, m32)
+                                                neg = T.simd.vcmps(k, T.uint32(0x80000000), m32, op="ge")
+                                                k = T.simd.vsel(T.simd.vxor(k, fused_ones, m32), T.simd.vxor(k, fused_sign, m32), neg)
+                                                k = T.simd.vsel(fused_sign, k, T.simd.vcmps(magnitude, T.uint32(0), m32, op="eq"))
+                                                k = T.simd.vsel(fused_ones, k, T.simd.vcmps(magnitude, T.uint32(0x7f800000), m32, op="gt"))
+                                            ids = T.simd.vadd(T.simd.vld(lanes[0]), T.simd.vdup(T.cast(chunk * NP + tile * 64, "uint32"), "uint32", m32), m32)
+                                            visible = T.simd.vcmps(ids, T.cast(begin, "uint32"), m32, op="ge")
+                                            visible = T.simd.pand(visible, T.simd.vcmps(ids, T.cast(end, "uint32"), m32, op="lt"), m32)
+                                            matched = T.simd.vcmps(T.simd.vand(k, high_mask, m32), prefix, m32, op="eq")
+                                            active32 = T.simd.pand(visible, matched, m32)
+                                            digit32 = T.simd.vand(T.simd.vshrs(k, 24 - round * 8, m32), byte_mask, m32)
+                                            active_values = T.simd.vsel(ones32, zero32, active32)
+                                            # Same narrowing layout for digit and 0/1 validity. Only
+                                            # nonzero validity lanes participate, regardless of part placement.
+                                            digits = T.simd.vcvt(digit32, "uint8", m8, part=0)
+                                            tags = T.simd.vcvt(active_values, "uint8", m8, part=0)
+                                            active8 = T.simd.vcmp(tags, zero8, m8, op="ne")
+                                            T.simd.dhistv2(f0, digits, active8, bin=0)
+                                            T.simd.dhistv2(f1, digits, active8, bin=1)
+                                        T.simd.vsts(hist[0, 0], f0, m16, dist="NORM_B16")
+                                        T.simd.vsts(hist[1, 0], f1, m16, dist="NORM_B16")
+                                    with T.SimdVF():
+                                        m16 = T.simd.pset(16)
+                                        m32 = T.simd.pset(32)
+                                        for bank in T.serial(2):
+                                            v = T.simd.vld(hist[bank, 0])
+                                            even = T.simd.vcvt(v, "uint32", m16, part=0)
+                                            odd = T.simd.vcvt(v, "uint32", m16, part=1)
+                                            T.simd.vsts(sums[bank * 128], T.simd.vadd(T.simd.vld(sums[bank * 128]), even, m32), m32)
+                                            T.simd.vsts(sums[bank * 128 + 64], T.simd.vadd(T.simd.vld(sums[bank * 128 + 64]), odd, m32), m32)
                             selected_bin = -1
                             bucket_cursor = T.alloc_var("int32", init=255)
                             while selected_bin < 0:
@@ -156,6 +236,9 @@ def topk_select_streaming(R: int, N: int, K: int, G: int, W: int, BLOCK: int = 0
                                     selected_bin = bucket_cursor
                             prefix = prefix | (T.cast(selected_bin, "uint32") << (24 - round * 8))
                             prefix_mask = prefix_mask | (T.uint32(255) << (24 - round * 8))
+                            if COMPACT and round == 0:
+                                position = (selected_bin // 128) * 128 + (selected_bin % 2) * 64 + (selected_bin % 128) // 2
+                                candidate_count = T.cast(sums[position], "int32")
                         for chunk in T.serial(T.ceildiv(N, NP)):
                             with T.SimdVF():
                                 m = T.simd.pset(32)
