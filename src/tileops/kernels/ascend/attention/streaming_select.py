@@ -11,11 +11,12 @@ def streaming_workspace_bytes(k, groups, block=0):
 
 
 @tilelang.jit(target="ascend", out_idx=[])
-def topk_select_streaming(R: int, N: int, K: int, G: int, W: int, BLOCK: int = 0, FUSE_KEYS: bool = False, COMPACT: bool = False):
+def topk_select_streaming(R: int, N: int, K: int, G: int, W: int, BLOCK: int = 0, FUSE_KEYS: bool = False, COMPACT: bool = False, SECOND_BUCKET: bool = False):
     assert 0 < K <= N < 2147483647 and G > 0 and 0 < W <= R
     NP = BLOCK or (8192 if G == 1 else 2048)
     assert NP in (2048, 8192, 16384)
     assert streaming_workspace_bytes(K, G, NP) <= 96 * 1024
+    assert not SECOND_BUCKET or COMPACT
     CAP = 4096
     assert not COMPACT or (FUSE_KEYS and G == 1 and streaming_workspace_bytes(K, G, NP) + CAP * 4 <= 96 * 1024)
     KP = (K + 63) // 64 * 64
@@ -66,7 +67,7 @@ def topk_select_streaming(R: int, N: int, K: int, G: int, W: int, BLOCK: int = 0
                                 for part in T.serial(4):
                                     T.simd.vsts(sums[part * 64], T.simd.vdup(T.uint32(0), "uint32", m), m)
                             if COMPACT and candidate_count > 0 and candidate_count <= CAP:
-                                if round == 1:
+                                if collected == 0:
                                     for chunk in T.serial(T.ceildiv(N, NP)):
                                         T.copy(bits[row, chunk * NP:chunk * NP + T.min(NP, N - chunk * NP)], keys[:T.min(NP, N - chunk * NP)])
                                         with T.SimdVF():
@@ -77,7 +78,7 @@ def topk_select_streaming(R: int, N: int, K: int, G: int, W: int, BLOCK: int = 0
                                             ones = T.simd.vdup(T.uint32(0xffffffff), "uint32", m)
                                             one = T.simd.vdup(T.uint32(1), "uint32", m)
                                             zero = T.simd.vdup(T.uint32(0), "uint32", m)
-                                            high = T.simd.vdup(T.uint32(0xff000000), "uint32", m)
+                                            high = T.simd.vdup(prefix_mask, "uint32", m)
                                             lane = T.simd.vld(lanes[0])
                                             offset = T.simd.alloc_var("uint32")
                                             offset = T.simd.vdup(T.cast(collected, "uint32"), "uint32", m)
@@ -236,7 +237,7 @@ def topk_select_streaming(R: int, N: int, K: int, G: int, W: int, BLOCK: int = 0
                                     selected_bin = bucket_cursor
                             prefix = prefix | (T.cast(selected_bin, "uint32") << (24 - round * 8))
                             prefix_mask = prefix_mask | (T.uint32(255) << (24 - round * 8))
-                            if COMPACT and round == 0:
+                            if COMPACT and (round == 0 or (SECOND_BUCKET and round == 1 and candidate_count > CAP)):
                                 position = (selected_bin // 128) * 128 + (selected_bin % 2) * 64 + (selected_bin % 128) // 2
                                 candidate_count = T.cast(sums[position], "int32")
                         for chunk in T.serial(T.ceildiv(N, NP)):
