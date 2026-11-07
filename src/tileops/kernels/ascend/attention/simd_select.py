@@ -12,7 +12,7 @@ def simd_workspace_bytes(n, k, groups):
 
 
 @tilelang.jit(target="ascend", out_idx=[])
-def topk_select_simd(R: int, N: int, K: int, G: int, W: int, COMPRESS: bool = False, VF_TILES: int = 1):
+def topk_select_simd(R: int, N: int, K: int, G: int, W: int, COMPRESS: bool = False, VF_TILES: int = 1, EARLY_BUCKET: bool = False):
     assert VF_TILES in (1, 4, 8, 16)
     assert 0 < K <= N < 65536 and G > 0 and 0 < W <= R
     assert simd_workspace_bytes(N, K, G) <= 96 * 1024
@@ -121,12 +121,22 @@ def topk_select_simd(R: int, N: int, K: int, G: int, W: int, COMPRESS: bool = Fa
                                 T.simd.vsts(hist[0, 0], f0, m16, dist="NORM_B16")
                                 T.simd.vsts(hist[1, 0], f1, m16, dist="NORM_B16")
                             selected_bin = -1
-                            for bucket in T.serial(256):
-                                if selected_bin < 0:
-                                    if remaining > T.cast(hist[(255 - bucket) // 128, (255 - bucket) % 128], "int32"):
-                                        remaining = remaining - T.cast(hist[(255 - bucket) // 128, (255 - bucket) % 128], "int32")
+                            if EARLY_BUCKET:
+                                bucket_cursor = T.alloc_var("int32", init=255)
+                                while selected_bin < 0:
+                                    bucket_count = T.cast(hist[bucket_cursor // 128, bucket_cursor % 128], "int32")
+                                    if remaining > bucket_count:
+                                        remaining = remaining - bucket_count
+                                        bucket_cursor = bucket_cursor - 1
                                     else:
-                                        selected_bin = 255 - bucket
+                                        selected_bin = bucket_cursor
+                            else:
+                                for bucket in T.serial(256):
+                                    if selected_bin < 0:
+                                        if remaining > T.cast(hist[(255 - bucket) // 128, (255 - bucket) % 128], "int32"):
+                                            remaining = remaining - T.cast(hist[(255 - bucket) // 128, (255 - bucket) % 128], "int32")
+                                        else:
+                                            selected_bin = 255 - bucket
                             prefix = prefix | (T.cast(selected_bin, "uint32") << (24 - round * 8))
                             prefix_mask = prefix_mask | (T.uint32(255) << (24 - round * 8))
                         if COMPRESS and VF_TILES > 1:

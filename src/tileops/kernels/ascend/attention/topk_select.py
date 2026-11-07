@@ -62,6 +62,7 @@ class AscendTopKSelectSIMDKernel(Kernel, TopKSelectFwdInterface):
     devices = frozenset({"npu"})
     compress_output = False
     output_tiles_per_vf = 1
+    early_bucket = False
 
     @classmethod
     def refusal(cls, call: TopKSelectCall):
@@ -87,7 +88,7 @@ class AscendTopKSelectSIMDKernel(Kernel, TopKSelectFwdInterface):
         self.program = (
             topk_select_simd(
                 self.rows, call.seq_len_kv, call.topk, call.kv_group, min(self.rows, 28),
-                self.compress_output, self.output_tiles_per_vf,
+                self.compress_output, self.output_tiles_per_vf, self.early_bucket,
             ) if self.rows else None
         )
 
@@ -119,10 +120,11 @@ class AscendTopKSelectCompactKernel(AscendTopKSelectSIMDKernel):
 class AscendTopKSelectGroupedCompactKernel(AscendTopKSelectCompactKernel):
     """Explicit experimental VF batch size; no automatic dispatch promotion."""
 
-    def __init__(self, call: TopKSelectCall, tiles_per_vf=4):
+    def __init__(self, call: TopKSelectCall, tiles_per_vf=4, early_bucket=False):
         if tiles_per_vf not in (4, 8, 16):
             raise ValueError("tiles_per_vf must be 4, 8 or 16")
         self.output_tiles_per_vf = tiles_per_vf
+        self.early_bucket = early_bucket
         super().__init__(call)
 
 
