@@ -9,6 +9,7 @@ from tileops.kernels.kernel_base import Entry, Kernel
 from .hierarchical_select import pack_candidates, pack_shards, remap_candidates
 from .radix_select import topk_select_ascend
 from .simd_select import simd_workspace_bytes, topk_select_simd
+from .streaming_select import streaming_workspace_bytes, topk_select_streaming
 
 
 class AscendTopKSelectKernel(Kernel, TopKSelectFwdInterface):
@@ -136,6 +137,31 @@ class AscendTopKSelectResidentKernel(AscendTopKSelectCompactKernel):
     preferred_over = frozenset({
         "ascend", "ascend_simd", "ascend_simd_compact", "ascend_hierarchical",
     })
+
+
+class AscendTopKSelectStreamingKernel(AscendTopKSelectSIMDKernel):
+    """Explicit long-row experiment; reuse the public tensor binding contract."""
+
+    @classmethod
+    def refusal(cls, call: TopKSelectCall):
+        if call.dtype != torch.float32 or call.out_dtype != torch.int32:
+            return "requires float32 scores and int32 output"
+        if not 0 < call.topk <= call.seq_len_kv < 2147483647:
+            return "requires positive K <= N within int32 count range"
+        if streaming_workspace_bytes(call.topk, call.kv_group) > 96 * 1024:
+            return "streaming buffers exceed 96 KiB"
+        return None
+
+    def __init__(self, call: TopKSelectCall):
+        reason = self.refusal(call)
+        if reason is not None:
+            raise ValueError(reason)
+        Kernel.__init__(self)
+        self.call = call
+        self.rows = call.batch * call.seq_len * call.kv_group
+        self.program = topk_select_streaming(
+            self.rows, call.seq_len_kv, call.topk, call.kv_group, min(self.rows, 28),
+        ) if self.rows else None
 
 
 class AscendTopKSelectHierarchicalKernel(Kernel, TopKSelectFwdInterface):
