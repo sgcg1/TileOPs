@@ -16,7 +16,7 @@ class AscendTopKSelectKernel(Kernel, TopKSelectFwdInterface):
 
     devices = frozenset({"npu"})
     # Keep the measured general implementation until the SIMD candidate is validated.
-    preferred_over = frozenset({"ascend_simd", "ascend_hierarchical"})
+    preferred_over = frozenset({"ascend_simd", "ascend_hierarchical", "ascend_simd_compact"})
 
     @classmethod
     def refusal(cls, call: TopKSelectCall):
@@ -60,6 +60,7 @@ class AscendTopKSelectSIMDKernel(Kernel, TopKSelectFwdInterface):
     """Resident SIMD candidate selected by resource constraints, not workload names."""
 
     devices = frozenset({"npu"})
+    compress_output = False
 
     @classmethod
     def refusal(cls, call: TopKSelectCall):
@@ -84,7 +85,8 @@ class AscendTopKSelectSIMDKernel(Kernel, TopKSelectFwdInterface):
         self.rows = call.batch * call.seq_len * call.kv_group
         self.program = (
             topk_select_simd(
-                self.rows, call.seq_len_kv, call.topk, call.kv_group, min(self.rows, 28)
+                self.rows, call.seq_len_kv, call.topk, call.kv_group, min(self.rows, 28),
+                self.compress_output,
             ) if self.rows else None
         )
 
@@ -105,6 +107,12 @@ class AscendTopKSelectSIMDKernel(Kernel, TopKSelectFwdInterface):
                 output.view(torch.uint32).reshape(self.rows, call.topk),
             )
         return output
+
+
+class AscendTopKSelectCompactKernel(AscendTopKSelectSIMDKernel):
+    """Same exact threshold selector with mask compression instead of double scan."""
+
+    compress_output = True
 
 
 class AscendTopKSelectHierarchicalKernel(Kernel, TopKSelectFwdInterface):
@@ -189,3 +197,5 @@ class AscendTopKSelectHierarchicalKernel(Kernel, TopKSelectFwdInterface):
 tileops.backend.register_kernel_type("TopKSelectFwdOp", "ascend", AscendTopKSelectKernel)
 tileops.backend.register_kernel_type("TopKSelectFwdOp", "ascend_simd", AscendTopKSelectSIMDKernel)
 tileops.backend.register_kernel_type("TopKSelectFwdOp", "ascend_hierarchical", AscendTopKSelectHierarchicalKernel)
+
+tileops.backend.register_kernel_type("TopKSelectFwdOp", "ascend_simd_compact", AscendTopKSelectCompactKernel)
