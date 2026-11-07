@@ -6,14 +6,15 @@ import tilelang.ascend.language.simd
 
 
 def streaming_workspace_bytes(k, groups):
-    return 4 * (8192 + ((k + 63) // 64 * 64) + (8192 * groups if groups > 1 else 0)) + 4096
+    block = 8192 if groups == 1 else 2048
+    return 4 * (block + ((k + 63) // 64 * 64) + (block * groups if groups > 1 else 0)) + 4096
 
 
 @tilelang.jit(target="ascend", out_idx=[])
 def topk_select_streaming(R: int, N: int, K: int, G: int, W: int):
     assert 0 < K <= N < 2147483647 and G > 0 and 0 < W <= R
     assert streaming_workspace_bytes(K, G) <= 96 * 1024
-    NP = 8192
+    NP = 8192 if G == 1 else 2048
     KP = (K + 63) // 64 * 64
     VF_TILES = 16
 
