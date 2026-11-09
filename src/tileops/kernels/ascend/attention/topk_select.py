@@ -152,7 +152,7 @@ class AscendTopKSelectStreamingKernel(AscendTopKSelectSIMDKernel):
             return "streaming buffers exceed 96 KiB"
         return None
 
-    def __init__(self, call: TopKSelectCall, block=0, fuse_keys=False, compact=False, second_bucket=False, fuse_compact_hist=False, *, worker_limit=32):
+    def __init__(self, call: TopKSelectCall, block=0, fuse_keys=False, compact=False, second_bucket=False, fuse_compact_hist=False, *, worker_limit=32, skip_full_clear=False):
         reason = self.refusal(call)
         if reason is not None:
             raise ValueError(reason)
@@ -168,7 +168,7 @@ class AscendTopKSelectStreamingKernel(AscendTopKSelectSIMDKernel):
         self.workers = min(self.rows, worker_limit)
         self.program = topk_select_streaming(
             self.rows, call.seq_len_kv, call.topk, call.kv_group, self.workers,
-            block, fuse_keys, compact, second_bucket, fuse_compact_hist,
+            block, fuse_keys, compact, second_bucket, fuse_compact_hist, skip_full_clear,
         ) if self.rows else None
 
 

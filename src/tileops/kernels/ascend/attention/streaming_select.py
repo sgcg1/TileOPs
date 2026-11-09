@@ -11,7 +11,7 @@ def streaming_workspace_bytes(k, groups, block=0):
 
 
 @tilelang.jit(target="ascend", out_idx=[])
-def topk_select_streaming(R: int, N: int, K: int, G: int, W: int, BLOCK: int = 0, FUSE_KEYS: bool = False, COMPACT: bool = False, SECOND_BUCKET: bool = False, FUSE_COMPACT_HIST: bool = False):
+def topk_select_streaming(R: int, N: int, K: int, G: int, W: int, BLOCK: int = 0, FUSE_KEYS: bool = False, COMPACT: bool = False, SECOND_BUCKET: bool = False, FUSE_COMPACT_HIST: bool = False, SKIP_FULL_CLEAR: bool = False):
     assert 0 < K <= N < 2147483647 and G > 0 and 0 < W <= R
     NP = BLOCK or (8192 if G == 1 else 2048)
     assert NP in (2048, 8192, 16384)
@@ -173,10 +173,12 @@ def topk_select_streaming(R: int, N: int, K: int, G: int, W: int, BLOCK: int = 0
                                             T.simd.vsts(sums[bank * 128 + 64], T.simd.vadd(T.simd.vld(sums[bank * 128 + 64]), odd, m32), m32)
                             else:
                                 for chunk in T.serial(T.ceildiv(N, NP)):
-                                    with T.SimdVF():
-                                        m = T.simd.pset(32)
-                                        for tile in T.serial(NP // 64):
-                                            T.simd.vsts(keys[tile * 64], T.simd.vdup(T.uint32(0), "uint32", m), m)
+                                    # Full contiguous copies overwrite every lane in the staging buffer.
+                                    if not SKIP_FULL_CLEAR or G != 1 or N % NP != 0:
+                                        with T.SimdVF():
+                                            m = T.simd.pset(32)
+                                            for tile in T.serial(NP // 64):
+                                                T.simd.vsts(keys[tile * 64], T.simd.vdup(T.uint32(0), "uint32", m), m)
                                     if G == 1:
                                         T.copy(bits[row, chunk * NP:chunk * NP + T.min(NP, N - chunk * NP)], keys[:T.min(NP, N - chunk * NP)])
                                     else:
@@ -272,10 +274,12 @@ def topk_select_streaming(R: int, N: int, K: int, G: int, W: int, BLOCK: int = 0
                                 position = (selected_bin // 128) * 128 + (selected_bin % 2) * 64 + (selected_bin % 128) // 2
                                 candidate_count = T.cast(sums[position], "int32")
                         for chunk in T.serial(T.ceildiv(N, NP)):
-                            with T.SimdVF():
-                                m = T.simd.pset(32)
-                                for tile in T.serial(NP // 64):
-                                    T.simd.vsts(keys[tile * 64], T.simd.vdup(T.uint32(0), "uint32", m), m)
+                            # Full contiguous copies overwrite every lane in the staging buffer.
+                            if not SKIP_FULL_CLEAR or G != 1 or N % NP != 0:
+                                with T.SimdVF():
+                                    m = T.simd.pset(32)
+                                    for tile in T.serial(NP // 64):
+                                        T.simd.vsts(keys[tile * 64], T.simd.vdup(T.uint32(0), "uint32", m), m)
                             if G == 1:
                                 T.copy(bits[row, chunk * NP:chunk * NP + T.min(NP, N - chunk * NP)], keys[:T.min(NP, N - chunk * NP)])
                             else:
