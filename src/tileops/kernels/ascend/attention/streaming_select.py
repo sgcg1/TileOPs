@@ -11,7 +11,7 @@ def streaming_workspace_bytes(k, groups, block=0):
 
 
 @tilelang.jit(target="ascend", out_idx=[])
-def topk_select_streaming(R: int, N: int, K: int, G: int, W: int, BLOCK: int = 0, FUSE_KEYS: bool = False, COMPACT: bool = False, SECOND_BUCKET: bool = False, FUSE_COMPACT_HIST: bool = False, SKIP_FULL_CLEAR: bool = False):
+def topk_select_streaming(R: int, N: int, K: int, G: int, W: int, BLOCK: int = 0, FUSE_KEYS: bool = False, COMPACT: bool = False, SECOND_BUCKET: bool = False, FUSE_COMPACT_HIST: bool = False, SKIP_FULL_CLEAR: bool = False, SKIP_OUTPUT_INIT: bool = False):
     assert 0 < K <= N < 2147483647 and G > 0 and 0 < W <= R
     NP = BLOCK or (8192 if G == 1 else 2048)
     assert NP in (2048, 8192, 16384)
@@ -50,10 +50,13 @@ def topk_select_streaming(R: int, N: int, K: int, G: int, W: int, BLOCK: int = 0
                     begin = T.alloc_var("int32", init=starts[row // G])
                     end = T.alloc_var("int32", init=ends[row // G])
                     T.copy(ramp, lanes)
-                    with T.SimdVF():
-                        m = T.simd.pset(32)
-                        for tile in T.serial(KP // 64):
-                            T.simd.vsts(result[tile * 64], T.simd.vdup(T.uint32(N), "uint32", m), m)
+                    # Short windows write indices and padding. Long windows write
+                    # K - remaining above-threshold indices and remaining ties.
+                    if not SKIP_OUTPUT_INIT:
+                        with T.SimdVF():
+                            m = T.simd.pset(32)
+                            for tile in T.serial(KP // 64):
+                                T.simd.vsts(result[tile * 64], T.simd.vdup(T.uint32(N), "uint32", m), m)
                     if end - begin <= K:
                         with T.SimdVF():
                             m = T.simd.pset(32)
