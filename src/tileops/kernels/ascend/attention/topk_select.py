@@ -152,7 +152,7 @@ class AscendTopKSelectStreamingKernel(AscendTopKSelectSIMDKernel):
             return "streaming buffers exceed 96 KiB"
         return None
 
-    def __init__(self, call: TopKSelectCall, block=0, fuse_keys=False, compact=False, second_bucket=False, fuse_compact_hist=False):
+    def __init__(self, call: TopKSelectCall, block=0, fuse_keys=False, compact=False, second_bucket=False, fuse_compact_hist=False, *, worker_limit=32):
         reason = self.refusal(call)
         if reason is not None:
             raise ValueError(reason)
@@ -160,11 +160,14 @@ class AscendTopKSelectStreamingKernel(AscendTopKSelectSIMDKernel):
             raise ValueError("unsupported streaming block size")
         if streaming_workspace_bytes(call.topk, call.kv_group, block) > 96 * 1024:
             raise ValueError("requested streaming block exceeds 96 KiB")
+        if worker_limit not in (28, 32):
+            raise ValueError("streaming worker limit must be 28 or 32")
         Kernel.__init__(self)
         self.call = call
         self.rows = call.batch * call.seq_len * call.kv_group
+        self.workers = min(self.rows, worker_limit)
         self.program = topk_select_streaming(
-            self.rows, call.seq_len_kv, call.topk, call.kv_group, min(self.rows, 28),
+            self.rows, call.seq_len_kv, call.topk, call.kv_group, self.workers,
             block, fuse_keys, compact, second_bucket, fuse_compact_hist,
         ) if self.rows else None
 
