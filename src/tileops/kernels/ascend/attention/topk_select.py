@@ -135,7 +135,7 @@ class AscendTopKSelectResidentKernel(AscendTopKSelectCompactKernel):
     output_tiles_per_vf = 16
     early_bucket = True
     preferred_over = frozenset({
-        "ascend", "ascend_simd", "ascend_simd_compact", "ascend_hierarchical",
+        "ascend", "ascend_simd", "ascend_simd_compact", "ascend_hierarchical", "ascend_streaming_early_emit",
     })
 
 
@@ -160,8 +160,8 @@ class AscendTopKSelectStreamingKernel(AscendTopKSelectSIMDKernel):
             raise ValueError("unsupported streaming block size")
         if streaming_workspace_bytes(call.topk, call.kv_group, block) > 96 * 1024:
             raise ValueError("requested streaming block exceeds 96 KiB")
-        if worker_limit not in (28, 32):
-            raise ValueError("streaming worker limit must be 28 or 32")
+        if not 1 <= worker_limit <= 32:
+            raise ValueError("streaming worker limit must be between 1 and 32")
         Kernel.__init__(self)
         self.call = call
         self.rows = call.batch * call.seq_len * call.kv_group
@@ -170,6 +170,37 @@ class AscendTopKSelectStreamingKernel(AscendTopKSelectSIMDKernel):
             self.rows, call.seq_len_kv, call.topk, call.kv_group, self.workers,
             block, fuse_keys, compact, second_bucket, fuse_compact_hist, skip_full_clear, skip_output_init, merge_hist_in_vf, emit_during_collect,
         ) if self.rows else None
+
+
+class AscendTopKSelectEarlyEmitKernel(AscendTopKSelectStreamingKernel):
+    """Exact streaming selection with early output for resource-fitting long rows."""
+
+    preferred_over = frozenset({
+        "ascend", "ascend_simd", "ascend_simd_compact", "ascend_hierarchical",
+    })
+
+    @classmethod
+    def refusal(cls, call: TopKSelectCall):
+        reason = super().refusal(call)
+        if reason is not None:
+            return reason
+        if call.kv_group != 1:
+            return "early output requires a contiguous single-group row"
+        if streaming_workspace_bytes(call.topk, call.kv_group, 16384) + 16384 > 96 * 1024:
+            return "early output buffers exceed 96 KiB"
+        return None
+
+    def __init__(self, call: TopKSelectCall):
+        from tilelang.carver.arch.driver import get_num_cube_cores
+
+        device_id = call.device.index
+        if device_id is None:
+            device_id = torch.npu.current_device()
+        workers = min(32, int(get_num_cube_cores(device_id) or 28))
+        super().__init__(
+            call, block=16384, fuse_keys=True, compact=True, second_bucket=True,
+            worker_limit=workers, skip_full_clear=True, emit_during_collect=True,
+        )
 
 
 class AscendTopKSelectHierarchicalKernel(Kernel, TopKSelectFwdInterface):
@@ -257,3 +288,4 @@ tileops.backend.register_kernel_type("TopKSelectFwdOp", "ascend_hierarchical", A
 
 tileops.backend.register_kernel_type("TopKSelectFwdOp", "ascend_simd_compact", AscendTopKSelectCompactKernel)
 tileops.backend.register_kernel_type("TopKSelectFwdOp", "ascend_resident", AscendTopKSelectResidentKernel)
+tileops.backend.register_kernel_type("TopKSelectFwdOp", "ascend_streaming_early_emit", AscendTopKSelectEarlyEmitKernel)
