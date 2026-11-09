@@ -11,7 +11,7 @@ def streaming_workspace_bytes(k, groups, block=0):
 
 
 @tilelang.jit(target="ascend", out_idx=[])
-def topk_select_streaming(R: int, N: int, K: int, G: int, W: int, BLOCK: int = 0, FUSE_KEYS: bool = False, COMPACT: bool = False, SECOND_BUCKET: bool = False, FUSE_COMPACT_HIST: bool = False, SKIP_FULL_CLEAR: bool = False, SKIP_OUTPUT_INIT: bool = False):
+def topk_select_streaming(R: int, N: int, K: int, G: int, W: int, BLOCK: int = 0, FUSE_KEYS: bool = False, COMPACT: bool = False, SECOND_BUCKET: bool = False, FUSE_COMPACT_HIST: bool = False, SKIP_FULL_CLEAR: bool = False, SKIP_OUTPUT_INIT: bool = False, MERGE_HIST_IN_VF: bool = False):
     assert 0 < K <= N < 2147483647 and G > 0 and 0 < W <= R
     NP = BLOCK or (8192 if G == 1 else 2048)
     assert NP in (2048, 8192, 16384)
@@ -250,17 +250,28 @@ def topk_select_streaming(R: int, N: int, K: int, G: int, W: int, BLOCK: int = 0
                                             active8 = T.simd.vcmp(tags, zero8, m8, op="ne")
                                             T.simd.dhistv2(f0, digits, active8, bin=0)
                                             T.simd.dhistv2(f1, digits, active8, bin=1)
-                                        T.simd.vsts(hist[0, 0], f0, m16, dist="NORM_B16")
-                                        T.simd.vsts(hist[1, 0], f1, m16, dist="NORM_B16")
-                                    with T.SimdVF():
-                                        m16 = T.simd.pset(16)
-                                        m32 = T.simd.pset(32)
-                                        for bank in T.serial(2):
-                                            v = T.simd.vld(hist[bank, 0])
-                                            even = T.simd.vcvt(v, "uint32", m16, part=0)
-                                            odd = T.simd.vcvt(v, "uint32", m16, part=1)
-                                            T.simd.vsts(sums[bank * 128], T.simd.vadd(T.simd.vld(sums[bank * 128]), even, m32), m32)
-                                            T.simd.vsts(sums[bank * 128 + 64], T.simd.vadd(T.simd.vld(sums[bank * 128 + 64]), odd, m32), m32)
+                                        if MERGE_HIST_IN_VF:
+                                            widened = T.simd.vcvt(f0, "uint32", m16, part=0)
+                                            T.simd.vsts(sums[0], T.simd.vadd(T.simd.vld(sums[0]), widened, m32), m32)
+                                            widened = T.simd.vcvt(f0, "uint32", m16, part=1)
+                                            T.simd.vsts(sums[64], T.simd.vadd(T.simd.vld(sums[64]), widened, m32), m32)
+                                            widened = T.simd.vcvt(f1, "uint32", m16, part=0)
+                                            T.simd.vsts(sums[128], T.simd.vadd(T.simd.vld(sums[128]), widened, m32), m32)
+                                            widened = T.simd.vcvt(f1, "uint32", m16, part=1)
+                                            T.simd.vsts(sums[192], T.simd.vadd(T.simd.vld(sums[192]), widened, m32), m32)
+                                        else:
+                                            T.simd.vsts(hist[0, 0], f0, m16, dist="NORM_B16")
+                                            T.simd.vsts(hist[1, 0], f1, m16, dist="NORM_B16")
+                                    if not MERGE_HIST_IN_VF:
+                                        with T.SimdVF():
+                                            m16 = T.simd.pset(16)
+                                            m32 = T.simd.pset(32)
+                                            for bank in T.serial(2):
+                                                v = T.simd.vld(hist[bank, 0])
+                                                even = T.simd.vcvt(v, "uint32", m16, part=0)
+                                                odd = T.simd.vcvt(v, "uint32", m16, part=1)
+                                                T.simd.vsts(sums[bank * 128], T.simd.vadd(T.simd.vld(sums[bank * 128]), even, m32), m32)
+                                                T.simd.vsts(sums[bank * 128 + 64], T.simd.vadd(T.simd.vld(sums[bank * 128 + 64]), odd, m32), m32)
                             selected_bin = -1
                             bucket_cursor = T.alloc_var("int32", init=255)
                             while selected_bin < 0:
